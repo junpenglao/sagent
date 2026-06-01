@@ -7185,6 +7185,188 @@ def test_runtime_has_no_dead_system_param() -> None:
     assert "system" not in params
 
 
+# ----------------------------------------------------------------------
+# preempt_in_flight: provider-side cancel on mid-stream peer messages.
+#
+# These tests cover the runtime branch added for CLI-driven providers
+# (AnthropicCLI / GoogleCLI) whose tool loop runs opaquely inside a
+# subprocess. ``_stop_all_tools`` has no cohort entries to act on for
+# those providers, so the only mid-turn cancellation surface is
+# ``model.cancel_in_flight()`` (provider-side SIGINT).
+# ----------------------------------------------------------------------
+
+
+@dataclass(kw_only=True, slots=True)
+class _CancellableBlockingModel:
+    """Model that blocks until cancelled; records cancel_in_flight calls."""
+
+    cancel_calls: list[float] = field(default_factory=list)
+    started: asyncio.Event = field(default_factory=asyncio.Event)
+    cancelled: asyncio.Event = field(default_factory=asyncio.Event)
+    _final: AssistantMessage = field(
+        default_factory=lambda: AssistantMessage(text="after-resume")
+    )
+    _first_call: bool = field(default=True, init=False)
+
+    async def stream(
+        self,
+        history: list[ModelContextEvent],
+        on_text: Callable[[str], None],
+        on_thinking: Callable[[str], None],
+    ) -> AssistantMessage:
+        del history, on_thinking
+        if self._first_call:
+            self._first_call = False
+            self.started.set()
+            try:
+                # Long sleep simulates an in-flight CLI turn that only
+                # exits when cancel_in_flight propagates a transport
+                # error from the subprocess. In the test the cancel sets
+                # ``self.cancelled``, which we use here to exit early.
+                await asyncio.wait_for(self.cancelled.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                pytest.fail("cancel was never observed; preempt branch did not fire")
+            raise RuntimeError("simulated provider transport error after SIGINT")
+        # Second turn after preempt drains the queued message.
+        for ch in self._final.text:
+            on_text(ch)
+        return self._final
+
+    def cancel_in_flight(self) -> bool:
+        self.cancel_calls.append(asyncio.get_running_loop().time())
+        self.cancelled.set()
+        return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_sleep
+async def test_preempt_in_flight_calls_cancel_on_agent_send_mid_stream() -> None:
+    """AgentSendMessage mid-stream triggers model.cancel_in_flight when opted in."""
+    model = _CancellableBlockingModel()
+    agent = agent_runtime.AgentRuntime(model=model, preempt_in_flight=True)
+    collector = EventCollector()
+    agent.observers.append(collector)
+    agent.inbox.push_back(UserMessage(text="start"))
+
+    async def send_correction() -> None:
+        await model.started.wait()
+        agent.inbox.push_back(
+            AgentSendMessage(source="tl", text="ABORT, switch direction"),
+        )
+
+    await asyncio.gather(
+        run_with_quit(agent, timeout_sec=5.0),
+        send_correction(),
+    )
+
+    assert len(model.cancel_calls) == 1, (
+        f"expected exactly one cancel_in_flight call, got {len(model.cancel_calls)}"
+    )
+    # The queued correction must have drained into history.
+    sends = [m for m in agent.context().messages if isinstance(m, AgentSendMessage)]
+    assert any("ABORT" in m.text for m in sends), (
+        f"queued AgentSendMessage did not reach history; got {[m.text for m in sends]!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_sleep
+async def test_preempt_in_flight_calls_cancel_on_user_message_mid_stream() -> None:
+    """UserMessage mid-stream also triggers cancel when preempt_in_flight is enabled."""
+    model = _CancellableBlockingModel()
+    agent = agent_runtime.AgentRuntime(model=model, preempt_in_flight=True)
+    collector = EventCollector()
+    agent.observers.append(collector)
+    agent.inbox.push_back(UserMessage(text="start"))
+
+    async def type_correction() -> None:
+        await model.started.wait()
+        agent.inbox.push_back(UserMessage(text="actually, do something else"))
+
+    await asyncio.gather(
+        run_with_quit(agent, timeout_sec=5.0),
+        type_correction(),
+    )
+
+    assert len(model.cancel_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_sleep
+async def test_preempt_in_flight_default_off_does_not_call_cancel() -> None:
+    """Without ``preempt_in_flight=True``, the existing buffer-only path is preserved."""
+    model = _CancellableBlockingModel()
+    agent = agent_runtime.AgentRuntime(model=model)  # default off
+    collector = EventCollector()
+    agent.observers.append(collector)
+    agent.inbox.push_back(UserMessage(text="start"))
+
+    async def send_correction_then_release() -> None:
+        await model.started.wait()
+        agent.inbox.push_back(
+            AgentSendMessage(source="tl", text="hello"),
+        )
+        # Without preempt, the runtime won't cancel — release manually so
+        # the model can return, the buffered message drains, and Quit can fire.
+        await asyncio.sleep(0.1)
+        model.cancelled.set()
+
+    await asyncio.gather(
+        run_with_quit(agent, timeout_sec=5.0),
+        send_correction_then_release(),
+    )
+
+    assert len(model.cancel_calls) == 0, (
+        "default off must not invoke cancel_in_flight; "
+        f"got {len(model.cancel_calls)} calls"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_sleep
+async def test_preempt_in_flight_silent_for_model_without_cancel_attr() -> None:
+    """A model lacking ``cancel_in_flight`` is handled silently (no AttributeError)."""
+
+    @dataclass(kw_only=True, slots=True)
+    class PlainBlockingModel:
+        started: asyncio.Event = field(default_factory=asyncio.Event)
+        released: asyncio.Event = field(default_factory=asyncio.Event)
+        _first_call: bool = field(default=True, init=False)
+
+        async def stream(
+            self,
+            history: list[ModelContextEvent],
+            on_text: Callable[[str], None],
+            on_thinking: Callable[[str], None],
+        ) -> AssistantMessage:
+            del history, on_text, on_thinking
+            if self._first_call:
+                self._first_call = False
+                self.started.set()
+                await self.released.wait()
+            return AssistantMessage(text="done")
+
+    model = PlainBlockingModel()
+    agent = agent_runtime.AgentRuntime(model=model, preempt_in_flight=True)
+    collector = EventCollector()
+    agent.observers.append(collector)
+    agent.inbox.push_back(UserMessage(text="start"))
+
+    async def send_then_release() -> None:
+        await model.started.wait()
+        # Should not raise even though the model has no cancel_in_flight.
+        agent.inbox.push_back(AgentSendMessage(source="tl", text="poke"))
+        await asyncio.sleep(0.1)
+        model.released.set()
+
+    await asyncio.gather(
+        run_with_quit(agent, timeout_sec=5.0),
+        send_then_release(),
+    )
+    # No assertion needed beyond "did not raise" — the test passes if
+    # run_with_quit returned without an exception.
+
+
 if __name__ == "__main__":
     from sagent.lib.testing import test_main
 

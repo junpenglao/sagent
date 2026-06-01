@@ -946,8 +946,18 @@ class AgentRuntime:
         tools: list[Tool] | None = None,
         compactor: Compactor | None = None,
         session_id: str = "",
+        preempt_in_flight: bool = False,
     ) -> None:
         self.model = model
+        # When True, mid-stream UserMessage / AgentSendMessage attempts a
+        # provider-side cancel (``model.cancel_in_flight()``) before
+        # buffering. Only useful with providers that drive their own
+        # tool loop opaquely (e.g. AnthropicCLI / GoogleCLI), where
+        # ``_stop_all_tools`` has no cohort entries to act on. Default
+        # off: changes user-observable timing (the in-flight model
+        # response is truncated to a ModelResponseError) and only the
+        # caller knows whether that tradeoff is desired for this agent.
+        self._preempt_in_flight = preempt_in_flight
         self.tools_map: dict[str, Tool] = {}
         for t in tools or []:
             if t.name in self.tools_map:
@@ -1979,6 +1989,24 @@ class AgentRuntime:
                                 # the coalesced UserMessage is published --
                                 # at which point the preview drops because the
                                 # buffer is empty. One UI surface at a time.
+                                # If ``preempt_in_flight`` is enabled,
+                                # additionally SIGINT the provider so a
+                                # CLI-driven opaque turn aborts immediately
+                                # rather than waiting for natural completion;
+                                # see AgentSendMessage handler below for the
+                                # rationale and failure mode.
+                                if self._preempt_in_flight:
+                                    cancel = getattr(
+                                        self.model, "cancel_in_flight", None,
+                                    )
+                                    if callable(cancel):
+                                        try:
+                                            cancel()
+                                        except Exception:  # noqa: BLE001 -- cancel is best-effort.
+                                            logger.exception(
+                                                "preempt_in_flight: "
+                                                "model.cancel_in_flight() raised",
+                                            )
                                 self._mid_stream_queue.append(item)
                             else:
                                 # Mid-cohort or idle: preempt and append.
@@ -1993,6 +2021,27 @@ class AgentRuntime:
 
                         case AgentSendMessage():
                             if self.model_call is not None:
+                                # Provider-side cancel for CLI-driven models
+                                # whose tool loop is opaque (no cohort to
+                                # detach). When enabled, SIGINT the
+                                # subprocess so the in-flight call resolves
+                                # as ModelResponseError; the buffered
+                                # message drains on the next gate firing.
+                                # No-op for providers without
+                                # ``cancel_in_flight`` or when the runtime
+                                # was not opted into preempt-in-flight.
+                                if self._preempt_in_flight:
+                                    cancel = getattr(
+                                        self.model, "cancel_in_flight", None,
+                                    )
+                                    if callable(cancel):
+                                        try:
+                                            cancel()
+                                        except Exception:  # noqa: BLE001 -- cancel is best-effort; do not poison the runtime loop on a provider quirk.
+                                            logger.exception(
+                                                "preempt_in_flight: "
+                                                "model.cancel_in_flight() raised",
+                                            )
                                 self._mid_stream_queue.append(item)
                             else:
                                 self._stop_all_tools(mode="detach")

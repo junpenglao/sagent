@@ -297,14 +297,84 @@ missing, check the most recent `ModelResponseComplete` in
 No structural fix yet. Stronger `PEER_MESSAGING` wording has been
 tried twice with limited effect.
 
-### B. `aborted_streaming` / `ede_diagnostic` respawn
+### B. `aborted_streaming` / `ede_diagnostic` errors (the biggest live problem)
 
-Sagent respawns the CLI subprocess automatically; the `restart_notice`
-observer (override #3) handles the model-side anchoring problem via
-splice-based outbound reconstruction. Open follow-up: expand sagent's
-`send_with_retry` whitelist (`agent/retry.py:345`) to honour the API's
-own `retry_delay_ms` schedule for these errors, which would reduce
-respawn frequency at the source. ~10 lines upstream; not yet staged.
+**This is the dominant operational pain point as of 2026-06-02 —
+worth its own section.** Across the day the Anthropic streaming API
+fired `SubprocessTransportError: aborted_streaming` and
+`ede_diagnostic` errors on opus and sonnet roughly once every 3–10
+minutes during sustained multi-agent traffic. Real examples observed
+today:
+
+- 12:53–12:58: three back-to-back errors on TL (5 min window).
+- 17:36–17:48: three errors on TL + one on statistician (12 min).
+- 18:29–18:30: two errors on TL inside 60 s — the second fired ~6 s
+  into the recovery turn, before the first had finished consolidating.
+- 19:02+: still flaring intermittently on the running server.
+
+**What it looks like operationally:**
+
+- The agent's CLI subprocess dies mid-stream with
+  `SubprocessTransportError("AnthropicCLI: result is_error: …
+  terminal_reason: aborted_streaming … errors: ['[ede_diagnostic]
+  result_type=user last_content_type=n/a stop_reason=tool_use'])`.
+- Sagent's `_AnthropicCLIModel` publishes `ModelResponseError` and
+  respawns a fresh `claude --print` subprocess automatically.
+- The respawn re-feeds history but strips `AssistantMessage` entries
+  (`anthropic_cli.py:537`). Without the `restart_notice` observer the
+  fresh subprocess has no record of its own prior delegations and
+  often re-issues them — the original symptom we built the observer
+  for.
+- **Each respawn eats a full prompt-cache miss.** Sagent's re-fed
+  byte sequence ≠ what claude's own session-resume would emit, so
+  Anthropic's cache key doesn't match. On opus this is the largest
+  single token cost per recovery.
+- The error response from the API includes a `retry_delay_ms`
+  schedule (we've seen `506 ms / 1247 ms / 2107 ms …` in headers).
+  **Sagent does not honour it.** `agent/retry.py:345`'s whitelist
+  bails on `aborted_streaming` / `ede_diagnostic` / `529` and goes
+  straight to subprocess respawn instead of retrying the same call.
+
+**What's mitigated today:**
+
+- ✅ Auto-respawn — sagent's `HotSpare` brings the agent back without
+  operator intervention.
+- ✅ Model-side anchoring on respawn — the `restart_notice` observer
+  (override #3 above) walks the tape, recovers each prior
+  `sagent_send`'s arguments, and splices a `[from sagent runtime]
+  You previously sent to @<peer>: "<content>"` after each matching
+  peer reply. The respawned subprocess sees the conversation as
+  paired outbound→inbound and naturally consolidates instead of
+  re-delegating.
+
+**What's NOT mitigated yet (the biggest open lever):**
+
+- ⏳ **Honour `retry_delay_ms` in `send_with_retry`** instead of
+  respawning. This is the upstream fix — ~10 lines in
+  `sagent/agent/retry.py:345` to expand the retryable-error whitelist
+  and use the schedule the API itself emits. Would eliminate most
+  respawns at the source (the cause, not the symptom), preserve the
+  prompt-cache, and make the `restart_notice` observer's job rare
+  rather than per-incident. Not yet staged.
+- ⏳ **Per-role circuit breaker** — when N `ModelResponseError`
+  events fire on one role within M minutes, auto-restart the role
+  and surface to the operator. Higher complexity. Only worth doing
+  if the upstream retry fix doesn't sufficiently quiet the errors.
+
+**Operator playbook** while we're stuck with respawns:
+
+- Watch the server log for
+  `RestartNoticeObserver: @<role> ModelResponseError`. Each line is
+  one recovery. Repeated firings on the same role within ~1 min
+  often cascade — consider `/api/restart` to wipe + recover cleanly
+  rather than letting the observer paper over multiple stacked
+  errors.
+- The web UI's per-agent diagnosis (`hung` with high `age_sec`) often
+  reflects a respawn in progress rather than a stuck agent.
+- Token cost spikes during error storms are real — opus respawns
+  burned ~$0.20–$0.40 per recovery in today's runs. If error
+  pressure stays elevated, prioritising the `retry_delay_ms`
+  upstream fix is the biggest single token-cost lever available.
 
 ---
 
@@ -312,4 +382,7 @@ respawn frequency at the source. ~10 lines upstream; not yet staged.
 
 Plugin is functional for daily operator use. `channel/` can be shut
 down in parallel whenever ready. The Phase 6 decision file is the
-remaining paperwork.
+remaining paperwork. **The `aborted_streaming` error rate is the
+dominant residual risk** — the in-plugin mitigation (`restart_notice`
+splice) is in place, but the upstream `send_with_retry` patch is
+the actual fix if the API pressure stays elevated.

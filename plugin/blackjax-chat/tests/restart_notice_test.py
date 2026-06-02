@@ -17,12 +17,19 @@ class _StubInbox:
 class _StubRuntime:
     inbox: _StubInbox = field(default_factory=_StubInbox)
     observers: list = field(default_factory=list)
-    history: list = field(default_factory=list)
 
 
-@dataclass
 class _StubAgent:
-    runtime: _StubRuntime = field(default_factory=_StubRuntime)
+    """Stand-in matching ``sagent.agent.Agent``'s public surface.
+
+    ``Agent.history`` is a @property over ``runtime.context().messages``
+    (agent.py:619). The observer reads ``target.history``, so the stub
+    exposes it as a plain attribute set by the test.
+    """
+
+    def __init__(self):
+        self.runtime = _StubRuntime()
+        self.history = []
 
 
 def test_install_attaches_observer():
@@ -81,7 +88,7 @@ def test_observer_quotes_single_unaddressed_message():
     )
 
     agent = _StubAgent()
-    agent.runtime.history = [
+    agent.history = [
         UserMessage(text="hello"),
         AssistantMessage(text="hi back"),
         UserMessage(text="please answer this question"),
@@ -116,7 +123,7 @@ def test_observer_enumerates_multiple_unaddressed_messages():
     )
 
     agent = _StubAgent()
-    agent.runtime.history = [
+    agent.history = [
         UserMessage(text="first task"),
         AssistantMessage(text="working on it"),
         AgentSendMessage(source="swe", text="here's my reply"),
@@ -152,7 +159,7 @@ def test_observer_skips_prior_restart_notices():
     )
 
     agent = _StubAgent()
-    agent.runtime.history = [
+    agent.history = [
         UserMessage(text="original prompt"),
         AssistantMessage(text="working"),
         UserMessage(
@@ -176,7 +183,7 @@ def test_observer_skips_prior_restart_notices():
         agent_registry.pop("tl", None)
 
 
-def test_observer_stops_at_assistant_with_tool_calls():
+def test_observer_stops_at_assistant_with_sagent_send():
     """An AssistantMessage with a sagent_send tool call counts as
     a productive activity boundary."""
     from runtime import restart_notice
@@ -188,7 +195,7 @@ def test_observer_stops_at_assistant_with_tool_calls():
     )
 
     agent = _StubAgent()
-    agent.runtime.history = [
+    agent.history = [
         UserMessage(text="please delegate"),
         AssistantMessage(
             text="",
@@ -206,6 +213,138 @@ def test_observer_stops_at_assistant_with_tool_calls():
         body = agent.runtime.inbox.pushed[0].text
         assert "new inbound after the send" in body
         assert "please delegate" not in body  # before the boundary
+    finally:
+        agent_registry.pop("tl", None)
+
+
+def test_observer_skips_intermediate_bash_tool_call():
+    """An AssistantMessage with non-``sagent_send`` tool calls (Bash, Read,
+    Glob…) is intermediate work, NOT a productive boundary.
+
+    Repro of the 2026-06-02 17:58 silent-restart false positive: after
+    receiving swe + statistician replies, TL ran a ``Bash find`` tool
+    call and went idle without consolidating + replying. The error fired
+    next. The catch-up zone MUST still include the swe/statistician
+    inbounds — they aren't addressed yet just because TL ran one Bash.
+    """
+    from runtime import restart_notice
+    from sagent.types.runtime import (
+        AgentSendMessage,
+        AssistantMessage,
+        ModelResponseError,
+        ToolCall,
+        UserMessage,
+    )
+
+    agent = _StubAgent()
+    agent.history = [
+        UserMessage(text="plan a benchmark"),
+        AssistantMessage(
+            text="Delegating to swe and statistician.",
+            tool_calls=(
+                ToolCall(id="t1", name="sagent_send",
+                         args={"to": "swe", "content": "..."}),
+                ToolCall(id="t2", name="sagent_send",
+                         args={"to": "statistician", "content": "..."}),
+            ),
+        ),
+        AgentSendMessage(source="swe", text="swe's implementation plan"),
+        AgentSendMessage(source="statistician", text="statistician's pairs"),
+        # Intermediate Bash tool call — MUST NOT count as productive.
+        AssistantMessage(
+            text="Let me check the catalog structure.",
+            tool_calls=(
+                ToolCall(id="t3", name="Bash",
+                         args={"command": "find tuningfork/catalog -name '*.json'"}),
+            ),
+        ),
+    ]
+    observer = restart_notice.install_on(agent, "tl")
+    from sagent.tools.core import agent_registry
+    agent_registry["tl"] = agent
+    try:
+        observer(ModelResponseError(exception=RuntimeError("test")))
+        assert len(agent.runtime.inbox.pushed) == 1, (
+            "observer must push exactly one notice; "
+            f"got {agent.runtime.inbox.pushed!r}"
+        )
+        body = agent.runtime.inbox.pushed[0].text
+        assert "[handoff from previous session]" in body
+        assert "swe's implementation plan" in body
+        assert "statistician's pairs" in body
+        # The intermediate AssistantMessage must NOT have been treated as
+        # a productive boundary, so we DON'T skip past the peer replies.
+        assert "@swe" in body
+        assert "@statistician" in body
+
+
+    finally:
+        agent_registry.pop("tl", None)
+
+
+def test_observer_stops_at_text_only_assistant_reply():
+    """An AssistantMessage with text AND no tool calls IS a productive
+    boundary — that's the model's turn-ending text reply."""
+    from runtime import restart_notice
+    from sagent.types.runtime import (
+        AssistantMessage,
+        ModelResponseError,
+        UserMessage,
+    )
+
+    agent = _StubAgent()
+    agent.history = [
+        UserMessage(text="explain X"),
+        # Text-only final reply: counts as productive.
+        AssistantMessage(text="X is …", tool_calls=()),
+        UserMessage(text="follow-up Y"),
+    ]
+    observer = restart_notice.install_on(agent, "tl")
+    from sagent.tools.core import agent_registry
+    agent_registry["tl"] = agent
+    try:
+        observer(ModelResponseError(exception=RuntimeError("test")))
+        body = agent.runtime.inbox.pushed[0].text
+        assert "follow-up Y" in body
+        assert "explain X" not in body
+    finally:
+        agent_registry.pop("tl", None)
+
+
+def test_observer_skips_runtime_error_user_message():
+    """When ``ModelResponseError`` is handled by the runtime, it appends
+    a synthetic ``UserMessage("[Error: …]")`` BEFORE publishing the event
+    (sagent/agent/runtime.py:1650). That synthetic message must NOT be
+    cited as an unaddressed inbound — it isn't a real peer/user message
+    and citing it would inject a self-reference loop.
+    """
+    from runtime import restart_notice
+    from sagent.types.runtime import (
+        AssistantMessage,
+        ModelResponseError,
+        UserMessage,
+    )
+
+    agent = _StubAgent()
+    agent.history = [
+        UserMessage(text="please answer"),
+        AssistantMessage(text="working on it"),
+        UserMessage(text="real new question"),
+        # Runtime-synthesised "[Error: …]" appended by runtime.py:1650
+        # right before our observer fires.
+        UserMessage(text="[Error: SubprocessTransportError: aborted_streaming]"),
+    ]
+    observer = restart_notice.install_on(agent, "tl")
+    from sagent.tools.core import agent_registry
+    agent_registry["tl"] = agent
+    try:
+        observer(ModelResponseError(exception=RuntimeError("test")))
+        assert len(agent.runtime.inbox.pushed) == 1
+        body = agent.runtime.inbox.pushed[0].text
+        assert "real new question" in body
+        # The synthetic error pseudo-inbound must not appear in the notice.
+        assert "[Error:" not in body
+        assert "SubprocessTransportError" not in body
     finally:
         agent_registry.pop("tl", None)
 

@@ -902,6 +902,171 @@ def _build_http_app(agents):
             )
         return JSONResponse({"ok": True, "to": to, "from": from_role, "delay_s": delay_s})
 
+    async def debug_seed_history(request: Request) -> Response:
+        """Append a preset history shape to one agent's tape.
+
+        Lets us deterministically reproduce specific history shapes for
+        observer validation without spending tokens on long
+        multi-agent runs. Loopback-only.
+
+        Body: ``{role: <label>, preset: <name>}``
+
+        Presets:
+          ``bug-shape-2026-06-02`` — the silent-restart false-positive
+          shape observed at 17:58: user prompt → AsstResp with two
+          ``sagent_send`` delegations → swe + statistician replies →
+          intermediate ``Bash`` tool-call AsstResp. Walk-back should
+          stop at the delegation AsstResp; catch-up zone should be the
+          two peer replies.
+        """
+        from sagent.types.runtime import (
+            AgentSendMessage,
+            AssistantMessage,
+            ToolCall,
+            UserMessage,
+        )
+
+        client_host = (request.client.host if request.client else "") or ""
+        if client_host not in ("127.0.0.1", "::1", "localhost", ""):
+            return JSONResponse(
+                {"error": "debug endpoints disabled: not a loopback client"},
+                status_code=403,
+            )
+        try:
+            payload = await request.json()
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"error": f"bad json: {exc}"}, status_code=400)
+        role = str(payload.get("role") or "").strip()
+        preset = str(payload.get("preset") or "").strip()
+        if role not in agents:
+            return JSONResponse(
+                {"error": f"unknown role {role!r}", "known": sorted(agents)},
+                status_code=404,
+            )
+        agent = agents[role]
+
+        if preset == "bug-shape-2026-06-02":
+            entries = [
+                UserMessage(
+                    text=(
+                        "We need to plan a small benchmark task. Goal: pick the "
+                        "3 most informative model/method pairs from the existing "
+                        "tuningfork suite to highlight in a tutorial.\n\n"
+                        "Please:\n"
+                        "1. Delegate to SWE for the implementation plan\n"
+                        "2. Delegate to statistician for which 3 pairs are best\n"
+                        "3. Consolidate and come back to me for approval"
+                    ),
+                ),
+                AssistantMessage(
+                    text="Delegating to swe and statistician for plan + pairs.",
+                    tool_calls=(
+                        ToolCall(
+                            id="seed_t1", name="sagent_send",
+                            args={"to": "swe", "content": "PLAN ONLY — design the file."},
+                        ),
+                        ToolCall(
+                            id="seed_t2", name="sagent_send",
+                            args={"to": "statistician",
+                                  "content": "PLAN ONLY — pick 3 pedagogical pairs."},
+                        ),
+                    ),
+                ),
+                AgentSendMessage(
+                    source="swe",
+                    text=(
+                        "## Implementation plan — `examples/benchmark_comparison.py`\n\n"
+                        "Load three committed recipe JSONs from the tuningfork catalog "
+                        "and produce a side-by-side comparison plot. Use "
+                        "`tuningfork.catalog.load_recipe` for the data; matplotlib "
+                        "for the plot. ~100 lines."
+                    ),
+                ),
+                AgentSendMessage(
+                    source="statistician",
+                    text=(
+                        "**3 pedagogical pairs — plan only, all from certified "
+                        "catalog results**\n\n"
+                        "Pair 1: eight_schools_ncp × NUTS — method matches model WIN.\n"
+                        "Pair 2: ill_cond_50 × adjusted_mclmc — breaks down (rhat=1.125).\n"
+                        "Pair 3: ill_cond_50 × NUTS dense — succeeds (ESS=4181)."
+                    ),
+                ),
+                # Intermediate Bash tool call — under the OLD walk-back this
+                # was wrongly treated as a productive boundary.
+                AssistantMessage(
+                    text="Let me check the catalog structure before consolidating.",
+                    tool_calls=(
+                        ToolCall(
+                            id="seed_t3", name="Bash",
+                            args={"command": "find tuningfork/catalog -name '*.json'"},
+                        ),
+                    ),
+                ),
+            ]
+        else:
+            return JSONResponse(
+                {"error": f"unknown preset {preset!r}",
+                 "known": ["bug-shape-2026-06-02"]},
+                status_code=404,
+            )
+
+        appended = 0
+        for entry in entries:
+            try:
+                agent.runtime.append_history(entry)
+                appended += 1
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(
+                    {"error": f"append_history failed at i={appended}: "
+                              f"{type(exc).__name__}: {exc}",
+                     "appended": appended},
+                    status_code=500,
+                )
+        return JSONResponse({
+            "ok": True, "role": role, "preset": preset,
+            "appended": appended,
+        })
+
+    async def debug_inject_error(request: Request) -> Response:
+        """Publish a synthetic ``ModelResponseError`` for one agent.
+
+        Lets us validate the ``restart_notice`` observer end-to-end
+        WITHOUT going through ``/api/restart`` (which calls
+        ``agent.clear()`` and wipes the history + inbox the observer
+        depends on). Loopback-only.
+
+        Body: ``{role: <label>, message: <optional str>}``
+        """
+        from sagent.types.runtime import ModelResponseError
+
+        client_host = (request.client.host if request.client else "") or ""
+        if client_host not in ("127.0.0.1", "::1", "localhost", ""):
+            return JSONResponse(
+                {"error": "debug endpoints disabled: not a loopback client"},
+                status_code=403,
+            )
+        try:
+            payload = await request.json()
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"error": f"bad json: {exc}"}, status_code=400)
+        role = str(payload.get("role") or "").strip()
+        msg = str(payload.get("message") or "debug-injected aborted_streaming")
+        if role not in agents:
+            return JSONResponse(
+                {"error": f"unknown role {role!r}", "known": sorted(agents)},
+                status_code=404,
+            )
+        agent = agents[role]
+        try:
+            agent.runtime.publish(ModelResponseError(exception=RuntimeError(msg)))
+            ok = True
+            note = "published ModelResponseError; history preserved"
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            note = f"publish failed: {type(exc).__name__}: {exc}"
+        return JSONResponse({"ok": ok, "role": role, "output": note})
+
     return Starlette(
         debug=False,
         routes=[
@@ -917,6 +1082,8 @@ def _build_http_app(agents):
             Route("/api/post", post, methods=["POST"]),
             Route("/api/defer", defer, methods=["POST"]),
             Route("/api/restart", restart, methods=["POST"]),
+            Route("/api/debug/inject_error", debug_inject_error, methods=["POST"]),
+            Route("/api/debug/seed_history", debug_seed_history, methods=["POST"]),
             # Backwards-compat aliases for the inline viewer's current
             # poll URLs; can be removed after the viewer is updated.
             Route("/messages", list_messages, methods=["GET"]),

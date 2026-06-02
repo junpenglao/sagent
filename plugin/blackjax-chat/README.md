@@ -292,6 +292,60 @@ What stays (ported with minor edits):
 
 ---
 
+## Sagent behaviour overrides (why we patch the upstream)
+
+Two sagent design choices need to be inverted for the chat-channel
+use case. Both are exposed as opt-in flags on the upstream
+`AgentRuntime` so other sagent users keep the original behaviour;
+plugin agents flip them via `Agent(...)` kwargs in `roles/common.py`.
+
+### 1. `coalesce_inbox=False`  (default upstream: `True`)
+
+Upstream sagent's `_append_or_coalesce_user` (`runtime.py:2474`)
+merges consecutive same-source `AgentSendMessage`s into a single
+history entry with `text = tail.text + "\n\n" + item.text`. This is
+correct for human-operator input (typing three lines in a row should
+arrive as one prompt) and satisfies Anthropic's user/assistant
+alternation rule when the model errored or was cancelled mid-turn.
+
+**Why we override:** in a multi-agent chat channel, each peer
+`sagent_send` is a deliberate, distinct event by the sender. If TL
+sends a delegation, then a correction, then a hard `STOP`, the
+recipient must see those as three separate inbounds — not as one
+9 KB blob with `STOP` buried at the bottom after `[Error: ...]` markers
+from any failed retries in between. Coalescing hides the most recent
+message inside the prior one and breaks the recipient's ability to
+process events as turns.
+
+**What the override does:** when `coalesce_inbox=False`, instead of
+merging into the tail, we inject a synthetic
+`AssistantMessage(text="(runtime: discrete-inbound boundary)")`
+between the prior user-side message and the new item. The synthetic
+turn satisfies the API alternation rule; each peer message remains a
+distinct history entry; the boundary marker tells the model that the
+prior turn ended (whatever the cause) and a fresh inbound follows.
+
+Verified 2026-06-02 against an organic in-channel scenario: TL sent a
+delegation, then 3 revisions (each preceded by a streaming-mode CLI
+error that injected `[Error: ...]` into the prior message's tail),
+then a hard `STOP`. Upstream coalescing produced a 9 800-char merged
+inbound to SWE with STOP at the bottom. With the override, SWE
+receives 5 discrete inbounds and STOP arrives as the latest standalone
+turn.
+
+### 2. `preempt_in_flight=True`  (default upstream: `False`)
+
+Already documented in our prior fork branch `feat/cli-preempt-via-sigint`:
+mid-stream peer messages send SIGINT to the in-flight
+`claude --print` subprocess via `model.cancel_in_flight()` before
+buffering. Required because the CLI runs the entire MCP tool loop
+opaquely — sagent's runtime can't see in-flight tool dispatches, so
+`_stop_all_tools` has nothing to act on. This patch is the
+prerequisite that makes mid-turn corrections actually preempt instead
+of waiting for the current turn to drain.
+
+---
+
 ## Running it
 
 ```bash

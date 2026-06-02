@@ -207,4 +207,7 @@ def build_agent(
         max_tool_call_rounds=max_tool_call_rounds,
         max_budget_usd=max_budget_usd,
         preempt_in_flight=True,
+        # Each peer ``sagent_send`` call must remain a distinct
+        # inbound — see README § "Sagent behaviour overrides".
+        coalesce_inbox=False,
     )

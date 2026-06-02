@@ -105,6 +105,17 @@ def _build_all_agents():
         agent._persistent = True
         agent_registry[label] = agent
         trace_writer.install_on(agent, label)
+        # Per-agent outbound log: populated by ``/api/post`` whenever
+        # this agent is the ``from`` role. The CLI provider's opaque
+        # MCP tool loop means ``sagent_send`` calls NEVER show up in
+        # ``AssistantMessage.tool_calls`` (anthropic_cli.py:924 always
+        # returns ``tool_calls=()``) — so the only place we can
+        # observe outbounds is at the /api/post HTTP entry point.
+        # The ``restart_notice`` observer reads from here on respawn
+        # to reconstruct the conversation the stripped
+        # AssistantMessages would otherwise hide.
+        # Shape: ``list[{"ts": iso, "to": role, "body": str}]``.
+        agent.runtime.outbound_log = []
         # Inject an orienting UserMessage after every
         # ModelResponseError so the respawned subprocess knows to
         # anchor on the most recent peer message rather than picking
@@ -833,6 +844,22 @@ def _build_http_app(agents):
                 target.runtime.inbox.push_back(
                     AgentSendMessage(source=from_role, text=body),
                 )
+            # Record this outbound on the SENDER's runtime so
+            # ``restart_notice`` can reconstruct it on respawn (see
+            # the comment at agent build time for why this is the
+            # only observable signal of an outbound).
+            sender = agent_registry.get(from_role)
+            if sender is not None and from_role in agents:
+                log = getattr(sender.runtime, "outbound_log", None)
+                if log is not None:
+                    from datetime import datetime as _dt, timezone as _tz
+                    log.append({
+                        "ts": _dt.now(_tz.utc).isoformat().replace(
+                            "+00:00", "Z"
+                        ),
+                        "to": to,
+                        "body": body,
+                    })
         return JSONResponse({"ok": True, "to": to, "from": from_role})
 
     async def defer(request: Request) -> Response:
@@ -922,7 +949,6 @@ def _build_http_app(agents):
         from sagent.types.runtime import (
             AgentSendMessage,
             AssistantMessage,
-            ToolCall,
             UserMessage,
         )
 
@@ -946,6 +972,12 @@ def _build_http_app(agents):
         agent = agents[role]
 
         if preset == "bug-shape-2026-06-02":
+            # NOTE on shape: the real CLI provider returns
+            # ``AssistantMessage(tool_calls=())`` (anthropic_cli.py:924)
+            # — so the seeded AssistantMessages here have empty
+            # ``tool_calls``. The outbound record lives in
+            # ``runtime.outbound_log`` (populated by /api/post in
+            # production), seeded directly below.
             entries = [
                 UserMessage(
                     text=(
@@ -960,17 +992,7 @@ def _build_http_app(agents):
                 ),
                 AssistantMessage(
                     text="Delegating to swe and statistician for plan + pairs.",
-                    tool_calls=(
-                        ToolCall(
-                            id="seed_t1", name="sagent_send",
-                            args={"to": "swe", "content": "PLAN ONLY — design the file."},
-                        ),
-                        ToolCall(
-                            id="seed_t2", name="sagent_send",
-                            args={"to": "statistician",
-                                  "content": "PLAN ONLY — pick 3 pedagogical pairs."},
-                        ),
-                    ),
+                    tool_calls=(),
                 ),
                 AgentSendMessage(
                     source="swe",
@@ -982,6 +1004,16 @@ def _build_http_app(agents):
                         "for the plot. ~100 lines."
                     ),
                 ),
+                # In production ``coalesce_inbox=False`` (override #1)
+                # injects this synthetic boundary between consecutive
+                # peer replies. ``runtime.append_history`` bypasses
+                # that path, so we have to include it in the seed
+                # ourselves to match real-runtime shape (and avoid
+                # alternation-rescue warnings on inject).
+                AssistantMessage(
+                    text="(runtime: discrete-inbound boundary)",
+                    tool_calls=(),
+                ),
                 AgentSendMessage(
                     source="statistician",
                     text=(
@@ -992,17 +1024,22 @@ def _build_http_app(agents):
                         "Pair 3: ill_cond_50 × NUTS dense — succeeds (ESS=4181)."
                     ),
                 ),
-                # Intermediate Bash tool call — under the OLD walk-back this
-                # was wrongly treated as a productive boundary.
                 AssistantMessage(
                     text="Let me check the catalog structure before consolidating.",
-                    tool_calls=(
-                        ToolCall(
-                            id="seed_t3", name="Bash",
-                            args={"command": "find tuningfork/catalog -name '*.json'"},
-                        ),
-                    ),
+                    tool_calls=(),
                 ),
+            ]
+            # Seed the outbound_log to match what /api/post would have
+            # recorded in production for this preset's conversation.
+            agent.runtime.outbound_log = [
+                {
+                    "ts": "2026-06-02T18:00:00Z", "to": "swe",
+                    "body": "PLAN ONLY — design the file.",
+                },
+                {
+                    "ts": "2026-06-02T18:00:01Z", "to": "statistician",
+                    "body": "PLAN ONLY — pick 3 pedagogical pairs.",
+                },
             ]
         else:
             return JSONResponse(

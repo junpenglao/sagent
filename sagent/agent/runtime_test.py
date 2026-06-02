@@ -4405,6 +4405,39 @@ class TestUserMessageAlternation:
         assert "u" in tail.text
         assert "a" in tail.text
 
+    def test_coalesce_inbox_false_keeps_messages_discrete(self) -> None:
+        """With coalesce_inbox=False, consecutive same-source AgentSends
+        stay as distinct history entries separated by a synthetic
+        assistant turn (alternation still satisfied)."""
+        model = ScriptedModel(responses=[])
+        agent = agent_runtime.AgentRuntime(model=model, coalesce_inbox=False)
+        agent._append_or_coalesce_user(AgentSendMessage(source="A", text="first"))
+        agent._append_or_coalesce_user(AgentSendMessage(source="A", text="second"))
+        messages = agent.context().messages
+        # Expect: AgentSend("first"), AssistantMessage(boundary), AgentSend("second")
+        assert len(messages) == 3, (
+            f"discrete mode must NOT merge; got {len(messages)}: {messages!r}"
+        )
+        assert isinstance(messages[0], AgentSendMessage)
+        assert messages[0].text == "first"
+        assert isinstance(messages[1], AssistantMessage)
+        assert "discrete-inbound boundary" in messages[1].text
+        assert isinstance(messages[2], AgentSendMessage)
+        assert messages[2].text == "second"
+
+    def test_coalesce_inbox_default_true_preserves_legacy_behavior(self) -> None:
+        """Default (coalesce_inbox=True) preserves the original merging
+        behaviour so existing sagent users see no change."""
+        model = ScriptedModel(responses=[])
+        agent = agent_runtime.AgentRuntime(model=model)  # default coalesce_inbox=True
+        agent._append_or_coalesce_user(AgentSendMessage(source="A", text="first"))
+        agent._append_or_coalesce_user(AgentSendMessage(source="A", text="second"))
+        messages = agent.context().messages
+        assert len(messages) == 1, (
+            f"default mode must coalesce; got {len(messages)}: {messages!r}"
+        )
+        assert "first" in messages[0].text and "second" in messages[0].text
+
 
 @pytest.mark.asyncio
 @pytest.mark.real_sleep

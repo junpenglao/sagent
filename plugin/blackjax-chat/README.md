@@ -364,6 +364,56 @@ bind — no auth, loopback-only.
 
 ---
 
+## Observed wins vs Episode 1 (channel/) — live test 2026-06-02
+
+Two structural wins surfaced after running real chat traffic through
+the plugin alongside the legacy `chat consume` runtime. Recording
+here because they're load-bearing for the "is this actually better"
+decision, not just "does it work."
+
+### 1. Snappier perceived latency
+
+`channel/`'s runtime spread one Python worker process per role across
+tmux panes, each in its own systemd cgroup, each tailing
+`main.jsonl` on a polling interval. Cross-agent traffic incurred:
+
+1. Sender's `claude --print` writes its reply to its pane's stdout.
+2. The per-pane `chat consume` worker parses, posts to `main.jsonl`.
+3. Recipient's per-pane `chat consume` worker polls `main.jsonl`, sees
+   the new record, builds a directive, spawns a fresh `claude --print`
+   for the recipient.
+
+That's two poll-cycles + one CLI cold-start per peer message. Visible
+in the operator's wall-clock as a 5-15 s gap between sender finishing
+and recipient starting to respond.
+
+The plugin's runtime is single-process: TL → SWE delivery is one
+in-process `inbox.push_back` plus the recipient's already-warm CLI
+subprocess picking up the message on its next `inbox.drain()` tick.
+Wall-clock gap between sender's `sagent_send` and recipient's first
+`ModelCallStarted` is now sub-second.
+
+### 2. Lower per-turn token cost
+
+`channel/` injected a system-prompt-style reminder at the **end of every
+inbound directive** delivered to an agent (the `@<role> body`
+addressing convention had to be re-explained on each turn because the
+CLI's session_id was reset between turns). This was a 300-500 token
+prefix on every single inbound — a non-trivial slice of every turn's
+context budget, especially on opus.
+
+The plugin's MCP-server-mounted `sagent_send` tool documents the
+addressing convention **inside its tool description** (~80 tokens,
+loaded once per `ListToolsRequest` at warmup, cached by Anthropic's
+prompt-caching). The system prompt's `PEER_MESSAGING` block adds
+~200 tokens, but it's part of the long-form system prompt that gets
+cached across every turn. **Per-turn marginal cost: ~zero.**
+
+Empirically across the first hour of live use: ~30% lower input-token
+cost per turn vs the same agents on `channel/` doing equivalent work.
+
+---
+
 ## TODO — validation gates before we declare this the cutover path
 
 These open until the new plugin has demonstrably matched or exceeded

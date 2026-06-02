@@ -164,6 +164,23 @@ def _model_spec_for(model_id: str):
     )
 
 
+def _session_id_for(role_name: str) -> str:
+    """Stable per-role UUIDv5 (so server restarts ``--resume`` the same
+    session rather than orphaning the prior one).
+
+    Uses a fixed-namespace UUIDv5 keyed by ``"blackjax-chat:<role>"`` so
+    the same role always derives the same session_id under the same
+    ``SAGENT_DATA_DIR``. To start fresh, ``rm
+    $HOME/.claude/projects/-<encoded-cwd>/<uuid>.jsonl`` (or use a
+    different ``SAGENT_DATA_DIR`` whose
+    ``CLAUDE_CODE_SKIP_PROMPT_HISTORY`` resets the slate).
+    """
+    import uuid as _uuid
+
+    namespace = _uuid.UUID("9e0e2c30-3f7e-4a13-9f5b-1a3a2c4d5e6f")
+    return str(_uuid.uuid5(namespace, f"blackjax-chat:{role_name}"))
+
+
 def build_agent(
     *,
     role_name: str,
@@ -210,6 +227,13 @@ def build_agent(
         model=provider.model(
             model_id,
             extra_mcp_servers={"sagent_chat": _sagent_mcp_server_entry(role_name)},
+            # Session persistence: claude owns the transcript on disk,
+            # we no longer re-feed history via stdin, and respawn after
+            # ``aborted_streaming`` ``--resume``s the live session
+            # (including all assistant turns + tool_use blocks) instead
+            # of inheriting a stripped re-feed. See sagent commit on
+            # ``feat/cli-session-resume`` for the full rationale.
+            session_id=_session_id_for(role_name),
         ),
         model_spec=_model_spec_for(model_id),
         system=load_system_prompt(role_md_path),

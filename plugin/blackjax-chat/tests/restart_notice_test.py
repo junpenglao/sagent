@@ -1,4 +1,22 @@
-"""Tests for the restart-notice observer."""
+"""Tests for the restart-notice observer.
+
+These tests model the REAL sagent CLI data flow:
+
+* ``AssistantMessage.tool_calls`` is always ``()`` (anthropic_cli.py:924
+  — the CLI provider runs MCP tool round-trips opaquely; tool_use
+  blocks don't propagate to sagent).
+* The only observable record of an outbound ``sagent_send`` is at
+  the HTTP entry point. ``serve.py`` populates
+  ``agent.runtime.outbound_log`` from ``/api/post`` on the SENDER's
+  runtime.
+* Peer replies arrive on the recipient's runtime as
+  ``AgentSendMessage`` events in the tape, with ``source`` = the
+  sender's role label.
+
+The observer reads the SENDER's ``outbound_log`` and pairs each
+entry FIFO-by-target with the corresponding ``AgentSendMessage``
+in the tape.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +32,7 @@ class _StubInbox:
 
 
 class _StubTapeRecord:
-    """Stand-in for sagent's ``ReferrableTapeEvent``: has ``ref`` and ``event``."""
+    """``ReferrableTapeEvent`` stand-in: has ``ref`` and ``event``."""
 
     def __init__(self, ref, event):
         self.ref = ref
@@ -32,14 +50,14 @@ class _StubSpliceCall:
 
 
 class _StubRuntime:
-    """Minimal runtime: an observable inbox, an observer list, a tape, and
-    a captured-splice-calls list (so tests can assert on what we'd splice).
-    """
+    """Minimal runtime exposing what the observer touches:
+    inbox, observers, tape, outbound_log, and ``append_splice``."""
 
     def __init__(self):
         self.inbox = _StubInbox()
         self.observers = []
         self.tape: list = []
+        self.outbound_log: list[dict] = []
         self.splices: list[_StubSpliceCall] = []
 
     def append_splice(self, *, insert_after, payload, strategy,
@@ -51,22 +69,22 @@ class _StubRuntime:
 
 
 class _StubAgent:
-    """Stand-in matching ``sagent.agent.Agent``'s public surface enough for
-    the observer.
-
-    The observer reads ``target.runtime`` (for tape + inbox) and
-    ``target.runtime.tape`` for the conversation walk. It no longer
-    consults ``agent.history``.
-    """
-
     def __init__(self):
         self.runtime = _StubRuntime()
 
 
-def _seed(agent: _StubAgent, *events) -> None:
-    """Append synthetic tape records (ref = sequential int) for each event."""
-    for i, ev in enumerate(events, start=len(agent.runtime.tape) + 1):
-        agent.runtime.tape.append(_StubTapeRecord(ref=i, event=ev))
+def _seed_tape(agent: _StubAgent, *events) -> list:
+    """Append synthetic tape records and return the list of refs."""
+    refs = []
+    for ev in events:
+        ref = len(agent.runtime.tape) + 1
+        agent.runtime.tape.append(_StubTapeRecord(ref=ref, event=ev))
+        refs.append(ref)
+    return refs
+
+
+def _outbound(to: str, body: str, ts: str = "2026-06-02T00:00:00Z") -> dict:
+    return {"ts": ts, "to": to, "body": body}
 
 
 def test_install_attaches_observer():
@@ -93,79 +111,61 @@ def test_observer_ignores_non_error_events():
         agent_registry.pop("tl", None)
 
 
-def test_observer_silent_when_tape_empty():
-    from runtime import restart_notice
-    from sagent.types.runtime import ModelResponseError
-
-    agent = _StubAgent()
-    observer = restart_notice.install_on(agent, "tl")
-    from sagent.tools.core import agent_registry
-    agent_registry["tl"] = agent
-    try:
-        observer(ModelResponseError(exception=RuntimeError("test")))
-        assert agent.runtime.inbox.pushed == []
-        assert agent.runtime.splices == []
-    finally:
-        agent_registry.pop("tl", None)
-
-
-def test_observer_silent_when_no_outbound_in_tape():
-    """No outbound sagent_send to pair → no reconstruction → no notice."""
+def test_observer_silent_when_outbound_log_empty():
+    """No outbounds recorded → nothing to reconstruct → silent."""
     from runtime import restart_notice
     from sagent.types.runtime import (
         AgentSendMessage,
-        AssistantMessage,
         ModelResponseError,
         UserMessage,
     )
 
     agent = _StubAgent()
-    _seed(
+    _seed_tape(
         agent,
-        UserMessage(text="hello"),
-        AssistantMessage(text="hi back", tool_calls=()),
-        AgentSendMessage(source="swe", text="unsolicited"),
+        UserMessage(text="hi"),
+        # Peer message but we never sent anything → no reconstruction.
+        AgentSendMessage(source="swe", text="unsolicited reply"),
     )
     observer = restart_notice.install_on(agent, "tl")
     from sagent.tools.core import agent_registry
     agent_registry["tl"] = agent
     try:
         observer(ModelResponseError(exception=RuntimeError("test")))
-        # No outbound was ever recorded, so the peer reply has nothing
-        # to pair with — silent restart.
-        assert agent.runtime.splices == []
         assert agent.runtime.inbox.pushed == []
+        assert agent.runtime.splices == []
     finally:
         agent_registry.pop("tl", None)
 
 
-def test_observer_splices_outbound_reconstruction_after_peer_reply():
-    """Core: agent delegated to swe → swe replied → observer splices the
-    outbound content after swe's reply, anchored on swe's tape ref."""
+def test_observer_splices_after_paired_peer_reply():
+    """The core: outbound recorded in log + peer reply in tape →
+    splice a (boundary AssistantMessage, reconstruction UserMessage)
+    pair after the peer reply.
+
+    Payload is a PAIR rather than a bare UserMessage because
+    AgentSendMessage is user-side; inserting a UserMessage straight
+    after it would violate role alternation and trigger sagent's
+    rescue-barrier code path. The boundary AssistantMessage keeps the
+    alternation clean."""
     from runtime import restart_notice
     from sagent.types.runtime import (
         AgentSendMessage,
         AssistantMessage,
         ModelResponseError,
-        ToolCall,
         UserMessage,
     )
 
     agent = _StubAgent()
-    _seed(
+    agent.runtime.outbound_log = [
+        _outbound("swe", "PLAN ONLY — design the file."),
+    ]
+    refs = _seed_tape(
         agent,
         UserMessage(text="plan a benchmark"),
-        AssistantMessage(
-            text="Delegating now.",
-            tool_calls=(
-                ToolCall(id="t1", name="sagent_send",
-                         args={"to": "swe",
-                               "content": "PLAN ONLY — design the file."}),
-            ),
-        ),
         AgentSendMessage(source="swe", text="## Implementation plan ..."),
     )
-    swe_ref = agent.runtime.tape[2].ref  # the AgentSendMessage record
+    swe_ref = refs[1]
 
     observer = restart_notice.install_on(agent, "tl")
     from sagent.tools.core import agent_registry
@@ -176,149 +176,82 @@ def test_observer_splices_outbound_reconstruction_after_peer_reply():
         splice = agent.runtime.splices[0]
         assert splice.insert_after == swe_ref
         assert splice.strategy == "restart_notice.outbound_reconstruction"
-        assert len(splice.payload) == 1
-        recon = splice.payload[0]
+        # Two-entry payload: boundary AssistantMessage, then the
+        # reconstruction UserMessage.
+        assert len(splice.payload) == 2
+        boundary, recon = splice.payload
+        assert isinstance(boundary, AssistantMessage)
+        assert "outbound-reconstruction boundary" in boundary.text
         assert isinstance(recon, UserMessage)
         assert "[from sagent runtime] You previously sent" in recon.text
         assert "@swe" in recon.text
         assert "PLAN ONLY — design the file." in recon.text
-
-        # And the inbox notice should be present too.
-        assert len(agent.runtime.inbox.pushed) == 1
+        # Inbox notice mentions the splice + synthesize directive.
         notice = agent.runtime.inbox.pushed[0].text
         assert "[handoff from previous session]" in notice
-        assert "spliced 1" in notice  # one reconstruction summarised
+        assert "spliced 1" in notice
         assert "synthesize" in notice.lower()
     finally:
         agent_registry.pop("tl", None)
 
 
-def test_observer_splices_multi_target_send():
-    """A single AssistantMessage with two sagent_send tool calls → both
-    peers' replies get paired splices."""
+def test_observer_pairs_multiple_outbounds_fifo_by_target():
+    """Two outbounds to @swe, then two replies from @swe → pair in order."""
     from runtime import restart_notice
     from sagent.types.runtime import (
         AgentSendMessage,
-        AssistantMessage,
         ModelResponseError,
-        ToolCall,
-        UserMessage,
     )
 
     agent = _StubAgent()
-    _seed(
+    agent.runtime.outbound_log = [
+        _outbound("swe", "first task", ts="2026-06-02T10:00:00Z"),
+        _outbound("statistician", "pick pairs", ts="2026-06-02T10:00:05Z"),
+        _outbound("swe", "second task", ts="2026-06-02T10:01:00Z"),
+    ]
+    refs = _seed_tape(
         agent,
-        UserMessage(text="plan + pick pairs"),
-        AssistantMessage(
-            text="Delegating.",
-            tool_calls=(
-                ToolCall(id="t1", name="sagent_send",
-                         args={"to": "swe", "content": "design the file"}),
-                ToolCall(id="t2", name="sagent_send",
-                         args={"to": "statistician", "content": "pick 3 pairs"}),
-            ),
-        ),
-        AgentSendMessage(source="swe", text="here's the plan"),
-        AgentSendMessage(source="statistician", text="here are 3 pairs"),
+        AgentSendMessage(source="swe", text="first reply"),
+        AgentSendMessage(source="statistician", text="pairs picked"),
+        AgentSendMessage(source="swe", text="second reply"),
     )
-    swe_ref = agent.runtime.tape[2].ref
-    stat_ref = agent.runtime.tape[3].ref
 
     observer = restart_notice.install_on(agent, "tl")
     from sagent.tools.core import agent_registry
     agent_registry["tl"] = agent
     try:
         observer(ModelResponseError(exception=RuntimeError("test")))
-        assert len(agent.runtime.splices) == 2
-        # Order matches tape order.
-        assert agent.runtime.splices[0].insert_after == swe_ref
-        assert "design the file" in agent.runtime.splices[0].payload[0].text
-        assert agent.runtime.splices[1].insert_after == stat_ref
-        assert "pick 3 pairs" in agent.runtime.splices[1].payload[0].text
-        # Notice mentions both.
-        notice = agent.runtime.inbox.pushed[0].text
-        assert "spliced 2" in notice
+        assert len(agent.runtime.splices) == 3
+        # FIFO-by-target. Each splice payload is (boundary, recon); the
+        # recon UserMessage at payload[1] carries the outbound content.
+        assert agent.runtime.splices[0].insert_after == refs[0]
+        assert "first task" in agent.runtime.splices[0].payload[1].text
+        assert agent.runtime.splices[1].insert_after == refs[1]
+        assert "pick pairs" in agent.runtime.splices[1].payload[1].text
+        assert agent.runtime.splices[2].insert_after == refs[2]
+        assert "second task" in agent.runtime.splices[2].payload[1].text
     finally:
         agent_registry.pop("tl", None)
 
 
-def test_observer_skips_already_reconstructed_refs_on_refire():
-    """Multiple ModelResponseError firings shouldn't double-splice peers
-    we've already reconstructed."""
+def test_observer_surfaces_orphan_outbound_no_reply_yet():
+    """Outbound recorded but peer hasn't replied → no splice, but
+    notice mentions as pending delegation."""
     from runtime import restart_notice
-    from sagent.types.runtime import (
-        AgentSendMessage,
-        AssistantMessage,
-        ModelResponseError,
-        ToolCall,
-        UserMessage,
-    )
+    from sagent.types.runtime import ModelResponseError, UserMessage
 
     agent = _StubAgent()
-    _seed(
-        agent,
-        UserMessage(text="task"),
-        AssistantMessage(
-            text="delegating",
-            tool_calls=(
-                ToolCall(id="t1", name="sagent_send",
-                         args={"to": "swe", "content": "do thing"}),
-            ),
-        ),
-        AgentSendMessage(source="swe", text="reply"),
-    )
-    observer = restart_notice.install_on(agent, "tl")
-    from sagent.tools.core import agent_registry
-    agent_registry["tl"] = agent
-    try:
-        observer(ModelResponseError(exception=RuntimeError("first")))
-        assert len(agent.runtime.splices) == 1
-        # Re-fire: same tape, no new pairs, so no new splice.
-        observer(ModelResponseError(exception=RuntimeError("second")))
-        assert len(agent.runtime.splices) == 1, (
-            "duplicate splice on re-fire — observer must track "
-            "already-reconstructed peer refs"
-        )
-        # The second fire produces a no-op notice path; no new inbox push.
-        assert len(agent.runtime.inbox.pushed) == 1
-    finally:
-        agent_registry.pop("tl", None)
+    agent.runtime.outbound_log = [
+        _outbound("swe", "do the thing"),
+    ]
+    _seed_tape(agent, UserMessage(text="delegate"))
 
-
-def test_observer_lists_pending_orphan_outbounds_in_notice():
-    """An outbound with no peer reply yet should appear in the notice as
-    a pending delegation — the model needs to know it's waiting on
-    that peer, not re-issue."""
-    from runtime import restart_notice
-    from sagent.types.runtime import (
-        AssistantMessage,
-        ModelResponseError,
-        ToolCall,
-        UserMessage,
-    )
-
-    agent = _StubAgent()
-    _seed(
-        agent,
-        UserMessage(text="delegate"),
-        AssistantMessage(
-            text="delegating",
-            tool_calls=(
-                ToolCall(id="t1", name="sagent_send",
-                         args={"to": "swe", "content": "do the thing"}),
-            ),
-        ),
-        # No swe reply yet.
-    )
     observer = restart_notice.install_on(agent, "tl")
     from sagent.tools.core import agent_registry
     agent_registry["tl"] = agent
     try:
         observer(ModelResponseError(exception=RuntimeError("test")))
-        # No splice because there's no peer reply to anchor on.
         assert agent.runtime.splices == []
-        # But the notice should surface the orphan.
-        assert len(agent.runtime.inbox.pushed) == 1
         notice = agent.runtime.inbox.pushed[0].text
         assert "Pending delegations" in notice
         assert "@swe" in notice
@@ -327,76 +260,91 @@ def test_observer_lists_pending_orphan_outbounds_in_notice():
         agent_registry.pop("tl", None)
 
 
-def test_observer_handles_list_target_in_sagent_send_args():
-    """``args.to`` can be a list of labels (multi-cast). Each label
-    becomes its own outbound entry."""
+def test_observer_skips_unsolicited_peer_message():
+    """Peer sends a message with no matching outbound in log → no
+    splice for that peer (we don't fabricate an outbound that never
+    happened)."""
     from runtime import restart_notice
-    from sagent.types.runtime import (
-        AgentSendMessage,
-        AssistantMessage,
-        ModelResponseError,
-        ToolCall,
-        UserMessage,
-    )
+    from sagent.types.runtime import AgentSendMessage, ModelResponseError
 
     agent = _StubAgent()
-    _seed(
+    agent.runtime.outbound_log = [_outbound("swe", "do X")]
+    refs = _seed_tape(
         agent,
-        UserMessage(text="multicast"),
-        AssistantMessage(
-            text="sending to both",
-            tool_calls=(
-                ToolCall(id="t1", name="sagent_send",
-                         args={"to": ["swe", "statistician"],
-                               "content": "you both pick this up"}),
-            ),
-        ),
-        AgentSendMessage(source="swe", text="got it"),
-        AgentSendMessage(source="statistician", text="me too"),
+        AgentSendMessage(source="swe", text="swe reply"),
+        AgentSendMessage(source="statistician", text="unsolicited"),
     )
     observer = restart_notice.install_on(agent, "tl")
     from sagent.tools.core import agent_registry
     agent_registry["tl"] = agent
     try:
         observer(ModelResponseError(exception=RuntimeError("test")))
-        assert len(agent.runtime.splices) == 2
+        # Only swe gets paired; statistician's unsolicited message
+        # has no outbound to anchor on → no splice for it.
+        assert len(agent.runtime.splices) == 1
+        assert agent.runtime.splices[0].insert_after == refs[0]
     finally:
         agent_registry.pop("tl", None)
 
 
-def test_observer_ignores_non_sagent_send_tool_calls():
-    """``Bash``, ``Read``, ``Glob`` tool calls must NOT be treated as
-    outbounds. They never trigger peer replies."""
+def test_observer_skips_already_reconstructed_refs_on_refire():
+    """Re-fire after more outbounds + replies arrive: only the new
+    peer ref gets a splice; old one stays put with its old outbound."""
     from runtime import restart_notice
-    from sagent.types.runtime import (
-        AgentSendMessage,
-        AssistantMessage,
-        ModelResponseError,
-        ToolCall,
-        UserMessage,
-    )
+    from sagent.types.runtime import AgentSendMessage, ModelResponseError
 
     agent = _StubAgent()
-    _seed(
-        agent,
-        UserMessage(text="plz read"),
-        AssistantMessage(
-            text="checking",
-            tool_calls=(
-                ToolCall(id="t1", name="Bash", args={"command": "ls"}),
-                ToolCall(id="t2", name="Read", args={"path": "/tmp/x"}),
-            ),
-        ),
-        AgentSendMessage(source="swe", text="unrelated reply"),
-    )
+    agent.runtime.outbound_log = [_outbound("swe", "first")]
+    refs = _seed_tape(agent, AgentSendMessage(source="swe", text="first reply"))
+
+    observer = restart_notice.install_on(agent, "tl")
+    from sagent.tools.core import agent_registry
+    agent_registry["tl"] = agent
+    try:
+        observer(ModelResponseError(exception=RuntimeError("first fire")))
+        assert len(agent.runtime.splices) == 1
+        assert "first" in agent.runtime.splices[0].payload[1].text
+
+        # New activity between fires: another outbound + reply.
+        agent.runtime.outbound_log.append(_outbound("swe", "second"))
+        new_refs = _seed_tape(
+            agent, AgentSendMessage(source="swe", text="second reply")
+        )
+
+        observer(ModelResponseError(exception=RuntimeError("second fire")))
+        assert len(agent.runtime.splices) == 2
+        # The NEW splice pairs the NEW reply with the NEW outbound.
+        assert agent.runtime.splices[1].insert_after == new_refs[0]
+        assert "second" in agent.runtime.splices[1].payload[1].text
+        # The OLD ref isn't double-spliced.
+        old_splice_count_after_refire = sum(
+            1 for s in agent.runtime.splices if s.insert_after == refs[0]
+        )
+        assert old_splice_count_after_refire == 1
+    finally:
+        agent_registry.pop("tl", None)
+
+
+def test_observer_handles_outbound_to_user_as_orphan():
+    """Outbounds to ``user`` never get a paired AgentSendMessage
+    reply (user doesn't send via the peer channel). They should
+    surface as orphan rather than crash."""
+    from runtime import restart_notice
+    from sagent.types.runtime import ModelResponseError, UserMessage
+
+    agent = _StubAgent()
+    agent.runtime.outbound_log = [_outbound("user", "here's the answer")]
+    _seed_tape(agent, UserMessage(text="ask"))
+
     observer = restart_notice.install_on(agent, "tl")
     from sagent.tools.core import agent_registry
     agent_registry["tl"] = agent
     try:
         observer(ModelResponseError(exception=RuntimeError("test")))
-        # Nothing to pair — no splice, no notice.
         assert agent.runtime.splices == []
-        assert agent.runtime.inbox.pushed == []
+        notice = agent.runtime.inbox.pushed[0].text
+        assert "@user" in notice
+        assert "here's the answer" in notice
     finally:
         agent_registry.pop("tl", None)
 

@@ -96,8 +96,12 @@ class RestartNoticeObserver:
             )
             return
 
-        # Read the full history at the moment of error.
-        history = getattr(target.runtime, "history", None) or []
+        # Read the full history at the moment of error. ``Agent.history`` is
+        # a @property that resolves to ``runtime.context().messages`` (see
+        # sagent/agent/agent.py:619). It is NOT a plain attribute on the
+        # runtime — reaching for ``target.runtime.history`` returns ``None``
+        # and silently degenerates to the "skip-silent-restart" path.
+        history = list(getattr(target, "history", None) or [])
         if not history:
             _LOG.info(
                 "RestartNoticeObserver: @%s history empty; skipping notice",
@@ -105,33 +109,59 @@ class RestartNoticeObserver:
             )
             return
 
-        # Walk backwards to find the agent's last "productive activity":
-        # an AssistantMessage with EITHER a sagent_send tool call OR
-        # non-empty text. Everything AFTER this point is the catch-up
-        # zone (inbounds the agent hasn't successfully addressed yet).
+        # Walk backwards to find the agent's last "productive activity".
+        # An AssistantMessage counts as a productive boundary only when it
+        # represents OUTBOUND COMMUNICATION:
+        #
+        #   (a) it contains a ``sagent_send`` tool call (peer/user message),
+        #       OR
+        #   (b) it contains non-empty text AND NO tool calls at all
+        #       (turn-ending text reply — the model finished and addressed
+        #       the inbound directly).
+        #
+        # An AssistantMessage with non-``sagent_send`` tool calls (``Bash``,
+        # ``Read``, ``Glob``, …) is INTERMEDIATE WORK, NOT a productive
+        # boundary. Treating intermediate tool-using turns as "addressed"
+        # was the source of the silent-restart false positive observed
+        # on 2026-06-02 17:58: after receiving swe + statistician replies,
+        # TL ran a single ``Bash find`` tool call and went idle WITHOUT
+        # consolidating + replying to the user — but the old walk-back
+        # stopped at that AssistantMessage and decided the catch-up zone
+        # was empty.
         catchup_start_idx = 0
         for i in range(len(history) - 1, -1, -1):
             entry = history[i]
             if not isinstance(entry, AssistantMessage):
                 continue
-            tool_calls = getattr(entry, "tool_calls", None) or ()
+            tool_calls = tuple(getattr(entry, "tool_calls", None) or ())
             had_send = any(
                 getattr(tc, "name", "") == "sagent_send"
                 for tc in tool_calls
             )
-            had_text = bool((getattr(entry, "text", "") or "").strip())
-            if had_send or had_text:
+            had_text_only = (
+                bool((getattr(entry, "text", "") or "").strip())
+                and not tool_calls
+            )
+            if had_send or had_text_only:
                 catchup_start_idx = i + 1
                 break
 
         # Collect unaddressed peer/user inbounds in the catch-up zone.
-        # Skip prior restart notices to prevent cascade re-citation.
+        # Skip:
+        #   * prior restart notices (cascade prevention),
+        #   * the runtime-synthesised ``"[Error: …]"`` UserMessage that
+        #     ``agent/runtime.py:1650`` appends when handling
+        #     ModelResponseError — it sits in history right before our
+        #     observer fires and isn't a real inbound the agent needs to
+        #     address; citing it would inject a self-reference loop.
         unaddressed: list[tuple[str, str]] = []
         for entry in history[catchup_start_idx:]:
             if not isinstance(entry, (UserMessage, AgentSendMessage)):
                 continue
             text = (getattr(entry, "text", "") or "").strip()
             if not text or _NOTICE_TAG in text:
+                continue
+            if text.startswith("[Error:"):
                 continue
             src = getattr(entry, "source", None) or "user"
             unaddressed.append((src, text))

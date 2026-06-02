@@ -252,6 +252,71 @@ def test_argv_contains_required_flags() -> None:
     assert cfg["mcpServers"]["sagent"]["url"].endswith("/mcp")
 
 
+def test_argv_session_id_swaps_no_persistence_for_session_id_flag() -> None:
+    """First-turn argv carries ``--session-id <uuid>`` instead of
+    ``--no-session-persistence``."""
+    argv = _build_anthropic_argv(
+        model_id="claude-sonnet-4-5",
+        system_prompt="be brief",
+        bridge_url="http://127.0.0.1:1234/mcp",
+        bridge_server_name="sagent",
+        session_id="deadbeef-1234-5678-9abc-deadbeef1234",
+        resume_existing=False,
+    )
+    assert "--no-session-persistence" not in argv
+    assert "--session-id" in argv
+    assert "--resume" not in argv
+    sid_idx = argv.index("--session-id")
+    assert argv[sid_idx + 1] == "deadbeef-1234-5678-9abc-deadbeef1234"
+
+
+def test_argv_session_id_resume_existing_uses_resume_flag() -> None:
+    """``resume_existing=True`` → ``--resume <uuid>``, no
+    ``--session-id``."""
+    argv = _build_anthropic_argv(
+        model_id="claude-sonnet-4-5",
+        system_prompt="be brief",
+        bridge_url="http://127.0.0.1:1234/mcp",
+        bridge_server_name="sagent",
+        session_id="deadbeef-1234-5678-9abc-deadbeef1234",
+        resume_existing=True,
+    )
+    assert "--no-session-persistence" not in argv
+    assert "--session-id" not in argv
+    assert "--resume" in argv
+    r_idx = argv.index("--resume")
+    assert argv[r_idx + 1] == "deadbeef-1234-5678-9abc-deadbeef1234"
+
+
+def test_argv_default_session_id_none_preserves_stateless_flag() -> None:
+    """No session_id → existing ``--no-session-persistence`` behaviour."""
+    argv = _build_anthropic_argv(
+        model_id="claude-sonnet-4-5",
+        system_prompt="x",
+        bridge_url="http://x",
+        bridge_server_name="sagent",
+    )
+    assert "--no-session-persistence" in argv
+    assert "--session-id" not in argv
+    assert "--resume" not in argv
+
+
+def test_model_session_id_initialises_session_persistent_mode() -> None:
+    """``AnthropicCLI.model(session_id=...)`` flips the mode flag,
+    bypasses HotSpare, and starts uninitialised."""
+    provider = AnthropicCLI()
+    sid = "deadbeef-1234-5678-9abc-deadbeef1234"
+    m = provider.model("claude-haiku-4-5", session_id=sid)
+    assert m._session_id == sid
+    assert m._session_initialized is False
+    assert m._hot_spare is None
+    assert m._active_proc is None
+    # Stateless companion still works.
+    m_stateless = provider.model("claude-haiku-4-5")
+    assert m_stateless._session_id is None
+    assert m_stateless._hot_spare is not None
+
+
 def test_user_line_text_only() -> None:
     """A plain ``UserMessage`` becomes a single ``content: str`` line."""
     line = _user_line(UserMessage(text="hello"), max_image_dim=8000)

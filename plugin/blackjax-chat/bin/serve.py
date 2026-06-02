@@ -45,15 +45,23 @@ from typing import Sequence
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PLUGIN_DIR))
 
+# Pulls in the data-dir resolution (env-configurable). All file paths
+# below derive from ``delivery.DATA_DIR`` / ``delivery.SESSIONS_DIR``
+# so a single ``SAGENT_DATA_DIR`` env var co-locates the audit log,
+# trace files, per-role mcp.json, sentinel, and debug log — useful
+# for end-of-day merges that union this plugin's main.jsonl with the
+# sibling chat/ runtime's main.jsonl in one directory.
+from mcp_sagent import delivery  # noqa: E402
+
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 8767
-_MAIN_JSONL = _PLUGIN_DIR / "main.jsonl"
+_MAIN_JSONL = delivery.MAIN_JSONL_PATH
 
 # Sentinel file: when present, the plugin's MCP server skips audit
 # log writes AND peer inbox pushes. Set during the bootstrap warmup
 # window. Path must match :data:`mcp_sagent.server._SUPPRESS_FLAG`.
-_SUPPRESS_FLAG = _PLUGIN_DIR / "sessions" / "_suppress_audit"
+_SUPPRESS_FLAG = delivery.SESSIONS_DIR / "_suppress_audit"
 
 _LOG = logging.getLogger("blackjax_chat.serve")
 
@@ -286,7 +294,7 @@ def _snippet(text: str, q: str, width: int = 180) -> str:
 
 def _iter_trace_files():
     """Yield ``(role, path)`` for every ``<role>.trace.jsonl`` under sessions/."""
-    sessions = _PLUGIN_DIR / "sessions"
+    sessions = delivery.SESSIONS_DIR
     if not sessions.exists():
         return
     for p in sorted(sessions.glob("*.trace.jsonl")):

@@ -31,8 +31,13 @@ from pathlib import Path
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-SESSIONS_DIR = PLUGIN_ROOT / "sessions"
 SERVER_SCRIPT = PLUGIN_ROOT / "mcp_sagent" / "server.py"
+
+# Per-role mcp.json files live in the data dir, NOT the plugin code
+# dir. Resolved via :mod:`mcp_sagent.delivery` so this module agrees
+# with where ``main.jsonl`` and the trace files land.
+from mcp_sagent import delivery  # noqa: E402
+SESSIONS_DIR = delivery.SESSIONS_DIR
 
 
 def write_role_config(

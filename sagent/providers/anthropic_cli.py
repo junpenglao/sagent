@@ -182,12 +182,20 @@ class AnthropicCLI(Anthropic):
         self,
         model_id: str | None = None,
         max_request_tokens: int | None = None,
+        *,
+        extra_mcp_servers: dict[str, dict] | None = None,
     ) -> _AnthropicCLIModel:
         """Build a CLI-backed model.
 
         Args:
           model_id: Claude model id; ``None`` uses ``DEFAULT_MODEL``.
           max_request_tokens: Override the profile's input cap.
+          extra_mcp_servers: Additional MCP servers (stdio or HTTP)
+            merged into the CLI's ``--mcp-config`` at subprocess spawn
+            time. Each entry follows Claude Code's mcp.json shape:
+            ``{"command": "...", "args": [...], "env": {...}}`` for
+            stdio or ``{"type": "http", "url": "..."}`` for HTTP. Keys
+            colliding with sagent's own bridge server name are dropped.
 
         Returns:
           model: Backend wrapping a managed ``claude`` subprocess.
@@ -214,6 +222,7 @@ class AnthropicCLI(Anthropic):
                 if max_request_tokens is not None
                 else profile.max_request_tokens
             ),
+            extra_mcp_servers=extra_mcp_servers,
         )
 
     @override
@@ -250,6 +259,7 @@ class _AnthropicCLIModel:
         model_id: str,
         profile: ModelProfile,
         max_request_tokens: int,
+        extra_mcp_servers: dict[str, dict] | None = None,
     ) -> None:
         self._provider = provider
         self._model_id = model_id
@@ -268,6 +278,10 @@ class _AnthropicCLIModel:
         # Set by ``stream`` before ``_spawn_initialized`` reads them.
         self._pending_system: str = ""
         self._sent_history_head: TapeEvent | None = None
+        # External MCP servers (stdio or HTTP) merged into the CLI's
+        # ``--mcp-config`` at subprocess spawn time. See
+        # :func:`_build_anthropic_argv`.
+        self._extra_mcp_servers = extra_mcp_servers
 
     @property
     def max_request_tokens(self) -> int:
@@ -628,6 +642,7 @@ class _AnthropicCLIModel:
             system_prompt=self._pending_system,
             bridge_url=self._tools_bridge.url,
             bridge_server_name=self._tools_bridge.server_name,
+            extra_mcp_servers=self._extra_mcp_servers,
         )
         proc = Subproc(
             argv,
@@ -765,15 +780,28 @@ def _build_anthropic_argv(
     system_prompt: str,
     bridge_url: str,
     bridge_server_name: str,
+    extra_mcp_servers: dict[str, dict] | None = None,
 ) -> list[str]:
-    """Assemble the ``claude --print --input-format stream-json ...`` argv."""
-    mcp_config = json.dumps(
-        {
-            "mcpServers": {
-                bridge_server_name: {"type": "http", "url": bridge_url},
-            }
-        }
-    )
+    """Assemble the ``claude --print --input-format stream-json ...`` argv.
+
+    ``extra_mcp_servers``, when provided, is merged into the
+    ``mcpServers`` block of the JSON written to ``--mcp-config``. Use
+    this to register stdio/HTTP MCP servers alongside sagent's own
+    in-process tool bridge. Caller is responsible for ensuring the
+    keys don't collide with ``bridge_server_name``; sagent's bridge
+    wins on conflict.
+    """
+    servers: dict[str, dict] = {
+        bridge_server_name: {"type": "http", "url": bridge_url},
+    }
+    if extra_mcp_servers:
+        for name, entry in extra_mcp_servers.items():
+            if name == bridge_server_name:
+                # Don't let an external entry stomp on the bridge that
+                # exposes sagent-native tools (Read/Bash/etc.).
+                continue
+            servers[name] = entry
+    mcp_config = json.dumps({"mcpServers": servers})
     return [
         "claude",
         "--print",

@@ -1156,6 +1156,14 @@ function renderTraceEvent(ev) {
     return;
   }
   if (kind === 'ModelResponsePartial') {
+    // Hidden by default — opus typically streams a 1KB assistant turn
+    // as 25-50 small ``ModelResponsePartial`` events; rendering each
+    // one as its own "stream:" row turns the trace into an
+    // unreadable wall of fragments. The full text appears in the
+    // ``ModelResponseComplete`` event below. Toggle visibility via
+    // localStorage('trace-show-partials') = '1' if you need to see
+    // the granular stream for debugging.
+    if (localStorage.getItem('trace-show-partials') !== '1') return;
     const t = (ev.text || '').replace(/\n/g, ' ');
     if (!t) return;
     const row = document.createElement('div');
@@ -1168,16 +1176,22 @@ function renderTraceEvent(ev) {
   if (kind === 'ModelResponseComplete') {
     const m = ev.message || {};
     const tcs = (m.tool_calls || []).map(t => t.name).filter(Boolean).join(', ');
-    const txt = (m.text || '').split('\n').find(l => l.trim()) || '';
+    // Preserve newlines in the preview so multi-line assistant text
+    // (markdown headers, bullet lists, code blocks) stays readable
+    // instead of collapsing into one wall-of-text line.
+    const txt = (m.text || '');
+    const preview = txt.length > 600 ? txt.slice(0, 600) + '…' : txt;
     const row = document.createElement('div');
     row.className = 'ev';
     const tail = tcs ? ` tool_use=[${escapeHtml(tcs)}]` : '';
     row.innerHTML = `<span class="ets">${ts}</span>
       <span class="marker end">■ assistant</span>${tail}
-      <div style="margin-left:16px;color:var(--text-dim);font-size:11.5px">
-        ${escapeHtml(txt.slice(0, 200))}
-      </div>`;
-    makeExpander(row, 'full assistant text', m.text);
+      <pre style="margin:4px 0 4px 16px;padding:6px 10px;background:var(--bg);
+                  border-left:2px solid var(--divider);white-space:pre-wrap;
+                  word-wrap:break-word;color:var(--text);font-size:11.5px;
+                  font-family:'SF Mono','Menlo','Consolas',monospace;
+                  max-height:300px;overflow-y:auto;">${escapeHtml(preview)}</pre>`;
+    if (txt.length > 600) makeExpander(row, 'full assistant text', txt);
     traceBody.appendChild(row);
     return;
   }
@@ -1199,6 +1213,12 @@ function renderTraceEvent(ev) {
   if (kind === 'ModelIdle' || kind === 'AgentIdle' ||
       kind === 'CohortStarted' || kind === 'CohortComplete' ||
       kind === 'SaveSession') {
+    // Hidden by default — these are runtime bookkeeping events that
+    // fire many times per turn (opus's recap produced 29
+    // ``SaveSession`` events in one turn) and add no signal for the
+    // operator. Toggle visibility via
+    // localStorage('trace-show-bookkeeping') = '1'.
+    if (localStorage.getItem('trace-show-bookkeeping') !== '1') return;
     const row = document.createElement('div');
     row.className = 'ev result';
     row.innerHTML = `<span class="ets">${ts}</span>● ${escapeHtml(kind)}`;

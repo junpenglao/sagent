@@ -90,7 +90,7 @@ def _build_all_agents():
     from sagent.testing import FakeAgent
     from sagent.tools.core import agent_registry
 
-    from runtime import trace_writer
+    from runtime import restart_notice, trace_writer
 
     builders = {
         "tl": build_tl,
@@ -105,6 +105,11 @@ def _build_all_agents():
         agent._persistent = True
         agent_registry[label] = agent
         trace_writer.install_on(agent, label)
+        # Inject an orienting UserMessage after every
+        # ModelResponseError so the respawned subprocess knows to
+        # anchor on the most recent peer message rather than picking
+        # an arbitrary earlier user-side message to "redo".
+        restart_notice.install_on(agent, label)
         agents[label] = agent
 
     # ``user`` is a mailbox-without-listener: ``sagent_send(to='user', …)``

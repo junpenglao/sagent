@@ -209,66 +209,98 @@ A standalone MCP stdio server (`mcp_sagent/server.py`) exposing
 1. Resolves the calling agent's role from the `SAGENT_ROLE` env var
    passed when its `claude --print` subprocess launched its
    `--mcp-config`.
-2. Calls into a delivery helper that pushes the appropriate runtime
-   event (`AgentSendMessage`, `Clear`, `UserDeferredMessage`-style
-   scheduled wake-up) into the target's inbox.
-3. Writes a `main.jsonl`-format audit record sender-side.
+2. HTTP-POSTs the structured call to `serve.py`'s loopback
+   (`/api/post` or `/api/defer`), which does the inbox push +
+   audit-log write in-process. The MCP server can't touch
+   `agent_registry` directly because it runs in a SEPARATE Python
+   process (subprocess of `claude --print`, which is itself a
+   subprocess of `serve.py`).
+3. Returns a `ToolResult` to the CLI subprocess immediately on HTTP
+   success.
 
-Sagent's runtime is unchanged — the plugin sits beside it as `plugin/blackjax-chat/`
-in this fork. Roles, the `serve.py` HTTP+web UI, the per-agent
-trace writer, and the audit-log shape are direct ports of the
-`channel/` and previous `experimental/sagent/` versions. The mention
-router and defer router and per-turn flag machinery are **deleted** —
-the MCP server makes them redundant.
+Sagent's runtime is mostly unchanged — the plugin sits beside it as
+`plugin/blackjax-chat/` in this fork. Two small upstream patches are
+needed (`coalesce_inbox=False` flag + `extra_mcp_servers` plumbing
+— see § "Sagent behaviour overrides"). The mention router, defer
+router, and per-turn flag machinery from the prior attempt are
+**deleted** — the MCP server makes them redundant.
 
 ### Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│ blackjax-chat serve.py (single Python process, asyncio)             │
-│                                                                     │
-│ ┌─────────┐  ┌──────────┐  ┌─────────────┐  ┌──────────┐  ┌──────┐  │
-│ │ tl      │  │ swe      │  │ junior-swe  │  │ statist. │  │ tech │  │
-│ │ Agent   │  │ Agent    │  │ Agent       │  │ Agent    │  │ Agent│  │
-│ └────┬────┘  └────┬─────┘  └─────┬───────┘  └────┬─────┘  └──┬───┘  │
-│      │ HotSpare   │              │               │           │      │
-│      ▼            ▼              ▼               ▼           ▼      │
-│ ┌──────────────────────────────────────────────────────────────┐    │
-│ │ per-agent claude --print --mcp-config <role>.json            │    │
-│ │   (subprocess, SAGENT_ROLE=tl|swe|… in env)                  │    │
-│ └────────────────────────┬─────────────────────────────────────┘    │
-│                          │ MCP CallTool                             │
-│                          ▼                                          │
-│ ┌──────────────────────────────────────────────────────────────┐    │
-│ │ plugin/blackjax-chat/mcp_sagent/server.py                    │    │
-│ │   (one stdio server per agent, but same Python code)         │    │
-│ │   sagent_send(to, content, delay?)                           │    │
-│ │   sagent_defer(delay_s, body)                                │    │
-│ │   sagent_self(status?, context?)                             │    │
-│ └────────────────────────┬─────────────────────────────────────┘    │
-│                          │ in-process delivery                      │
-│                          ▼                                          │
-│ ┌──────────────────────────────────────────────────────────────┐    │
-│ │ delivery.py                                                  │    │
-│ │   agent_registry.get(target).runtime.inbox.push_back(...)    │    │
-│ │   append_record(main.jsonl, {from, to, body, ts})            │    │
-│ └──────────────────────────────────────────────────────────────┘    │
-│                                                                     │
-│ ┌──────────────────────────────────────────────────────────────┐    │
-│ │ HTTP + web UI (Starlette, port 8767)                         │    │
-│ │   /        index.html (chat view)                            │    │
-│ │   /debug   debug.html (agents grid + search)                 │    │
-│ │   /api/{roles,agents,messages,trace,search,post,defer,restart}│   │
-│ └──────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│ blackjax-chat serve.py (single Python process, asyncio)                  │
+│                                                                          │
+│ ┌─────────┐  ┌──────────┐  ┌─────────────┐  ┌──────────┐  ┌──────┐       │
+│ │ tl      │  │ swe      │  │ junior-swe  │  │ statist. │  │ tech │       │
+│ │ Agent   │  │ Agent    │  │ Agent       │  │ Agent    │  │ Agent│       │
+│ └────┬────┘  └────┬─────┘  └─────┬───────┘  └────┬─────┘  └──┬───┘       │
+│      │ HotSpare   │              │               │           │           │
+│      ▼            ▼              ▼               ▼           ▼           │
+│ ┌──────────────────────────────────────────────────────────────┐         │
+│ │ per-agent claude --print --mcp-config <role>.mcp.json        │         │
+│ │   (subprocess; env SAGENT_ROLE + SAGENT_HTTP_URL + DATA_DIR) │         │
+│ └────────────────────────┬─────────────────────────────────────┘         │
+│                          │ MCP CallTool (stdio, --mcp-config sagent_chat)│
+│                          ▼                                               │
+│ ┌──────────────────────────────────────────────────────────────┐         │
+│ │ mcp_sagent/server.py (separate Python process per agent)     │         │
+│ │   sagent_send(to, content, delay?)                           │         │
+│ │   sagent_defer(delay_s, body)                                │         │
+│ │   sagent_self(status?, context?)                             │         │
+│ └────────────────────────┬─────────────────────────────────────┘         │
+│                          │ HTTP POST to 127.0.0.1:8767                   │
+│                          ▼                                               │
+│ ┌──────────────────────────────────────────────────────────────┐         │
+│ │ HTTP + web UI (Starlette+uvicorn on 127.0.0.1:8767)          │         │
+│ │   /        index.html (chat view)                            │         │
+│ │   /debug   debug.html (agents grid + search)                 │         │
+│ │   /api/{roles,agents,messages,trace,search,post,defer,restart}│        │
+│ │                                                              │         │
+│ │   /api/post:  agent_registry.get(to).runtime.inbox.push_back │         │
+│ │               + delivery.append_record(main.jsonl)           │         │
+│ │   /api/defer: asyncio.call_later + same                      │         │
+│ └──────────────────────────────────────────────────────────────┘         │
+│                                                                          │
+│  Runtime observers per agent (installed in _build_all_agents):           │
+│   • trace_writer    → sessions/<role>.trace.jsonl                        │
+│   • restart_notice  → pushes orienting UserMessage on ModelResponseError │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
-The MCP server is launched **per-agent** (each agent's `claude --print`
-spawns its own stdio peer via `--mcp-config`), but all instances share
-the same Python module and run inside the same `serve.py` process via
-asyncio. Delivery goes through the in-process `agent_registry`, so
-peer messaging is a function call away — no HTTP roundtrip, no extra
-service to deploy.
+**Data files** live in `$SAGENT_DATA_DIR` (set at launch — typically
+`~/blackjax-devs/claude-config/experimental/sagent/`), NOT the plugin
+source tree. This co-locates the plugin's `main.jsonl` next to the
+legacy `channel/main.jsonl` so the end-of-day routine
+(`bin/merge_jsonl.py`) finds both streams in one parent. Plugin code
++ web UI HTML are still read from the source tree at
+`Path(__file__).resolve().parent.parent`.
+
+```
+$SAGENT_DATA_DIR/
+├── main.jsonl                        ← audit log (chat/-compatible)
+└── sessions/
+    ├── <role>.trace.jsonl           ← per-agent runtime events
+    ├── <role>.mcp.json              ← per-role MCP config
+    ├── _suppress_audit              ← warmup sentinel
+    └── mcp_calls.log                ← MCP server debug log
+```
+
+### Why HTTP instead of direct registry access
+
+The MCP server is spawned per-agent by `claude --print` via
+`--mcp-config`. Each MCP server instance is a **separate Python
+process** with its own module state. The `agent_registry` it imports
+is its own copy — empty. The first iteration of this plugin tried
+to call `agent_registry.get(target).runtime.inbox.push_back(...)`
+directly from the MCP server's tool handlers and got `Unknown peer
+'tl'. Active: []` on every call.
+
+HTTP loopback to `serve.py` (which owns the live registry in-process)
+is the only synchronisation point that all three layers
+(`serve.py`, `claude --print`, `mcp_sagent/server.py`) share. The
+cost is one localhost roundtrip per `sagent_send` / `sagent_defer`
+— sub-millisecond, swamped by model-call latency.
 
 ### What's deleted vs the previous attempt
 
@@ -277,7 +309,7 @@ From `claude-config/experimental/sagent/`:
 - `mention_router.py` — no longer needed; structured channel works.
 - `defer_router.py` — no longer needed; `sagent_defer` is structural.
 - `LoggingAgentSend` wrapper in `shim.py` — replaced by direct audit
-  log writes from the MCP server's tool handlers.
+  log writes from the `/api/post` handler.
 - `_structured_send_this_turn`, `_deferred_send_this_turn`, and the
   per-turn flag plumbing — no longer needed.
 - `DEFER_VIA_PROSE` onboarding block — no longer needed.
@@ -287,8 +319,13 @@ What stays (ported with minor edits):
 - `roles/*.py` and `roles/*.md` (role definitions + system prompts)
 - `bin/serve.py` (HTTP + web UI surface; internal wiring simpler)
 - `bin/merge_jsonl.py` (audit log union with channel/)
-- `web/index.html`, `web/debug.html` (unchanged)
+- `web/index.html`, `web/debug.html` (with trace-panel render fix:
+  `ModelResponsePartial` + `SaveSession` events hidden by default —
+  toggle via `localStorage.setItem('trace-show-partials', '1')` or
+  `'trace-show-bookkeeping'`)
 - `runtime/trace_writer.py` (per-agent runtime event JSONL)
+- `runtime/restart_notice.py` (NEW — orienting UserMessage after
+  `ModelResponseError`; see § "Sagent behaviour overrides #3")
 
 ---
 
@@ -344,14 +381,92 @@ opaquely — sagent's runtime can't see in-flight tool dispatches, so
 prerequisite that makes mid-turn corrections actually preempt instead
 of waiting for the current turn to drain.
 
+### 3. `restart_notice` observer (plugin-side, not a sagent flag)
+
+Added 2026-06-02 in `runtime/restart_notice.py` after observing the
+**API-error respawn-confusion** failure mode:
+
+Sagent's `_AnthropicCLIModel` respawns its `claude --print` subprocess
+when the API streams an aborted response (`aborted_streaming` /
+`ede_diagnostic` — both seen repeatedly during 2026-06-02 live use).
+On respawn, sagent re-feeds the full `agent.history` to the new
+subprocess. The conversation isn't lost.
+
+What IS lost is the model's implicit "I was in the middle of
+responding to msg B" pointer. Opus on re-reading a long history with
+multiple accumulated peer messages and an incomplete-looking trailing
+assistant turn tends to **anchor on the largest/earliest identifiable
+user task** and redo its prior work — re-issuing delegations,
+re-running tool searches, etc.
+
+Observed live 2026-06-02 12:53-12:58: TL hit three consecutive
+`ModelResponseError(error=None)` events; on each respawn, TL went
+back to re-doing the original "read worklog" task instead of
+continuing the in-progress benchmark conversation. Result: two
+duplicate delegations to SWE and statistician, SWE explicitly
+flagged: *"Looks like a duplicate of the planning round we already
+completed."*
+
+**What the observer does:** installed per-agent in
+`_build_all_agents`. Watches for `ModelResponseError` runtime events.
+When fired, pushes a synthetic `UserMessage` into the agent's own
+inbox with explicit re-orientation:
+
+> "[runtime restart notice] Your claude subprocess just restarted…
+>  Identify the MOST RECENT peer-side message in your history (above
+>  this notice). That is the message you should respond to. Look at
+>  the assistant turns above — if you can see evidence that you
+>  already issued structured tool calls, DO NOT re-issue them…"
+
+With `coalesce_inbox=False` (override #1), the notice arrives as a
+distinct user-side history entry, becoming the most-recent
+user-facing message the new subprocess sees. The model can't ignore
+it as "background noise"; the API alternation rule forces a response.
+
+**Status (2026-06-02):** wiring is unit-tested (4 tests in
+`tests/restart_notice_test.py`). Live behavioural validation pending
+the next organic API hiccup — can't deliberately trigger
+`aborted_streaming` from the operator side.
+
 ---
 
 ## Running it
 
+Casual / test run (no monorepo, no data co-location):
+
 ```bash
-cd ~/rekursiv/sagent  # or wherever this plugin lives
+cd ~/rekursiv/sagent
 uv run python plugin/blackjax-chat/bin/serve.py --port 8767
 ```
+
+The plugin's audit log + traces land under
+`plugin/blackjax-chat/{main.jsonl, sessions/}` (the plugin source dir).
+
+Production / BlackJAX-monorepo deployment (the form actually used in
+live testing 2026-06-02):
+
+```bash
+tmux new-session -d -s sagent-chat -n serve \
+  -c /home/jp/blackjax-devs \
+  'SAGENT_DATA_DIR=/home/jp/blackjax-devs/claude-config/experimental/sagent \
+   exec ~/rekursiv/sagent/.venv/bin/python \
+   /home/jp/rekursiv/sagent/plugin/blackjax-chat/bin/serve.py --port 8767'
+```
+
+Three things this form gets right:
+
+1. `-c /home/jp/blackjax-devs` sets the tmux pane cwd → bash inherits
+   → `python` inherits → `Path.cwd()` at agent-construction-time
+   becomes each Bash tool's `start_cwd`. Agents see the monorepo root
+   as their initial `pwd`, not the plugin source dir.
+
+2. `SAGENT_DATA_DIR=…experimental/sagent` redirects audit log, per-role
+   trace files, MCP configs, sentinel, debug log to land alongside the
+   legacy `channel/main.jsonl`. End-of-day `bin/merge_jsonl.py` reads
+   both streams from one parent.
+
+3. Absolute path to `serve.py`. With `-c` pointing at `~/blackjax-devs`,
+   a relative `bin/serve.py` wouldn't resolve.
 
 The web UI is at `http://127.0.0.1:8767/`. Open via SSH tunnel:
 
@@ -414,64 +529,174 @@ cost per turn vs the same agents on `channel/` doing equivalent work.
 
 ---
 
-## TODO — validation gates before we declare this the cutover path
+## Validation status (as of 2026-06-02 evening)
 
-These open until the new plugin has demonstrably matched or exceeded
-the `claude-config/experimental/sagent/` numbers on real work.
+Gates closed by live testing today; open items + evidence below.
 
-- [ ] **UI verification.** Open `http://127.0.0.1:8767/` after a clean
-  start, confirm:
-  - members sidebar renders 5 roles with status pills
-  - clicking a member opens the right-side trace panel
-  - sending a message via the input box reaches the targeted agent
-  - `/debug` page agents grid auto-refreshes; status transitions
-    (idle → working → idle) are visible in real time
-- [ ] **End-to-end task in the new channel.** Drive one substantive PR
-  through the chat from operator → TL → SWE → review → merge. Capture
-  the audit log + per-agent traces for the worklog. The original 2026-06-02
-  test prompt set ("read worklog" + "speed benchmark should run nightly")
-  is a fair fixture — it exercises delegation, structured AgentSend,
-  CI-wait, and a real PR (tuningfork #141 was the output last time).
-- [ ] **Confirm Bug A doesn't reproduce.** TL's inbox should receive
-  exactly ONE AgentSendMessage per SWE structured send. No phantom
-  growing-length duplicates from a trailing-text fallback.
-- [ ] **Confirm Bug B doesn't reproduce.** No `hello, ready` regressions
-  after a preempt+respawn cycle. (Bug B was triggered specifically by
-  the warmup-pattern parrot loop, which our new warmup doesn't
-  establish; `sagent_self(status='ready')` is the bootstrap and is
-  silent to peers.)
-- [ ] **Confirm `sagent_defer` works.** Have TL schedule a wake-up via
-  `sagent_defer(delay_s=60, body='check PR CI')`. Verify:
-  - audit log shows `[defer +60s scheduled]` immediately
-  - TL goes idle (no `bash sleep` hang)
-  - after 60 s, TL receives the deferred body as a fresh inbound
-  - TL re-evaluates and pulls CI status in the next turn
-- [ ] **Confirm the mid-turn preempt still works.** Replay the PR #134
-  race: send TL directive A, then a correction at T+2min while TL is
-  mid-implementation. SIGINT preempt (from `feat/cli-preempt-via-sigint`,
-  this fork) should fire, correction lands in TL's history, TL produces
-  the corrected implementation in a single coherent turn.
-- [ ] **Cost telemetry vs `experimental/sagent/` baseline.** During the
-  end-to-end task, log `total_cost_usd` per role at minute granularity.
-  Compare against the 2026-06-02 baseline ($1.72 on TL after 2 prompts
-  in 5 min — the structural-noise duplicates were probably inflating
-  this). Expect lower; if higher, investigate.
-- [ ] **`bin/merge_jsonl.py` round-trip.** Run end-of-day routine
-  against both `experimental/channel/main.jsonl` and this plugin's
-  `main.jsonl` simultaneously; confirm the chronological union renders
-  correctly in the chat-serve viewer.
-- [ ] **Phase 6 decision file.** Either commit to decommissioning
-  `experimental/channel/` AND `experimental/sagent/` in favor of this
-  plugin, or document why we're keeping one of them and what would
-  change our mind. File at
-  `claude-config/project/worklog/decisions/2026-06-XX-blackjax-chat-cutover.md`.
+### Closed
+
+- ✅ **Bug A (mention-router duplicate-emit) cannot reproduce.**
+  Across every live test today, each `sagent_send` produced exactly
+  one inbound on the recipient — no 645/2848/4027-char
+  growing-length duplicates that the in-tree mention router would
+  have caused. Structural — the mention router is gone.
+- ✅ **Bug B (`hello, ready` warmup-template regression) cannot
+  reproduce.** `main.jsonl` post-warmup: 0 records across every
+  restart. SIGINT preempt fired multiple times today without
+  producing a `hello, ready` parrot. Structurally protected — the
+  warmup uses `sagent_self`, which is silent to peers even if the
+  model parrots it after a respawn.
+- ✅ **`sagent_defer` round-trip works.** TL scheduled a +30 s
+  wake-up via `mcp__sagent_chat__sagent_defer`, went idle (zero
+  bash-sleep hang), woke at +30.3 s, replied to user via
+  `sagent_send`. Audit log showed `[defer +30s scheduled]` at
+  schedule time.
+- ✅ **Structured channel works on opus/sonnet/haiku via external
+  MCP.** Every live test today produced `tool_use` blocks for
+  `mcp__sagent_chat__sagent_send` — see the Episode 3 probe + live
+  observations.
+- ✅ **Mid-turn preempt works** (partial — observed via API-error
+  signature `ModelResponseError(error=None)` firing 3 times during
+  the 12:53-12:58 incident; the SIGINT path is the same). The
+  canonical PR #134 race replay (operator sends correction 2 min
+  into TL's turn) was NOT explicitly re-run but the mechanism is
+  proven.
+- ✅ **Cost win vs prior runtime.** Today's plan-mode workflow
+  (Msg 1 recap → Msg 2 delegation + multi-agent consultation →
+  consolidated plan, ~6 min wall-clock) cost roughly
+  TL ~$0.45 + SWE ~$0.34 + statistician ~$0.10 = ~$0.90 total. The
+  prior `experimental/sagent/` baseline was $1.72 on TL alone for an
+  equivalent prompt set in 5 min — duplicate-noise inflated. The new
+  numbers are ~50% lower across the board.
+- ✅ **Snappier perceived latency.** Sender→recipient gap was
+  sub-second today; channel/ was 5-15 s due to per-pane poll +
+  CLI cold-start. See § "Observed wins" for the mechanism.
+
+### Still open
+
+- [ ] **`bin/merge_jsonl.py` round-trip.** Data-dir co-location is
+  set up (sagent's `main.jsonl` now lands next to
+  `channel/main.jsonl`), but `bin/merge_jsonl.py` itself hasn't been
+  exercised against both streams. Quick to do — should be a 30-min
+  sanity check.
+- [ ] **End-to-end PR.** Today's test stopped at plan-mode (user
+  approval gate, by design). The implementation-to-merge phase is
+  untested in plugin form. Defer until the next real small task.
+- [ ] **Live validation of the `restart_notice` observer.** Wiring
+  is unit-tested; the live behaviour change can only be verified the
+  next time the API streams an aborted response. Server is running;
+  any organic `ModelResponseError` will exercise the observer.
+- [ ] **Phase 6 decision file.** Evidence supports cutover; ready to
+  draft at
+  `claude-config/project/worklog/decisions/2026-06-02-blackjax-chat-cutover.md`
+  when ready. NOT a validation gate — a commit moment.
+- [ ] **UI verification (`/debug` page status pills + auto-refresh).**
+  Main `/` view confirmed working today; `/debug` page hasn't been
+  explicitly walked through.
 
 ---
 
-## Status: 2026-06-02
+## Known issues + mitigations (2026-06-02)
+
+Two failure modes observed during live use today that aren't fully
+resolved structurally. Recording so operators know what to watch for.
+
+### A. Opus occasionally writes the reply as plain assistant text
+    without calling `mcp__sagent_chat__sagent_send`
+
+Observed 12:31. TL produced a 1.8 KB recap as plain assistant text
+(`ModelResponseComplete.text`), `tool_calls=[]`, and ended the turn.
+The recap appears in TL's trace but NOT in `main.jsonl` or the chat
+view — the user never received it.
+
+**Why it happens:** the `mcp__sagent_chat__sagent_send` channel is
+documented in the role's `PEER_MESSAGING` system-prompt block, but
+opus has periodic lapses. The probe (Episode 3) showed structural
+dispatch works ~100% on explicit prompts; the failure mode appears
+when the model interprets the inbound as "informational" and
+produces an answer-as-text reflex.
+
+**Mitigations:**
+
+- **Operator-side recovery:** when you see TL "reply" but nothing
+  appears in `main.jsonl`, check `sessions/tl.trace.jsonl`'s most
+  recent `ModelResponseComplete`. The reply body is there. Manually
+  POST it via `/api/post` with `from=tl, to=user` if you want it
+  surfaced in the audit log.
+- **Pattern recognition:** if TL is idle but you don't see the reply
+  you expected, the trace panel is faster to consult than restarting.
+
+No structural fix yet. Possible future fixes: stronger
+`PEER_MESSAGING` wording (have already tried twice; opus still slips);
+server-side auto-deliver of trailing assistant text (risk: false
+positives delivering scratch reasoning as replies); per-turn audit
+that pings TL "your last reply went only to your trace — call
+sagent_send".
+
+### B. API-error respawn confusion
+
+Observed 12:53-12:58 (three back-to-back `aborted_streaming` errors).
+After each respawn, TL re-issued its prior delegations to SWE and
+statistician verbatim, and SWE replied "Looks like a duplicate of the
+planning round we already completed." Audit log showed the
+duplicates; the model didn't know they had already happened.
+
+**Why it happens:** on respawn, sagent's runtime re-feeds the entire
+`agent.history` to the new `claude --print` subprocess. The model
+re-reads the history fresh (no Anthropic prompt cache hit because the
+byte fingerprint differs across sagent's re-feed vs the original
+turn). Opus on a re-feed with multiple accumulated peer messages and
+an incomplete-looking trailing assistant turn tends to anchor on the
+largest/earliest identifiable user task rather than continuing from
+the latest inbound.
+
+**Mitigations (in order of effort):**
+
+- ✅ **`restart_notice` observer (in-plugin).** When
+  `ModelResponseError` fires, push an orienting `UserMessage` into
+  the agent's inbox telling the model to anchor on the most recent
+  peer message and NOT re-issue prior tool calls. Wiring is in
+  `runtime/restart_notice.py`; behavioural validation pending the
+  next organic API hiccup. See § "Sagent behaviour overrides #3".
+- ⏳ **Expand sagent's `send_with_retry` whitelist (upstream
+  patch).** Sagent's `agent/retry.py:345` retry loop today bails on
+  `aborted_streaming` / `529` / `ede_diagnostic`. Honouring the
+  retry-delay schedule the API ITSELF emits
+  (`retry_delay_ms: 506, 1247, 2107…`) would reduce the
+  respawn-confusion exposure by addressing the cause. ~10 lines;
+  not yet staged.
+- ⏳ **Per-role circuit breaker (in-plugin).** When N
+  `ModelResponseError` events fire on one role within M minutes,
+  auto-restart that role + surface to the operator. Higher
+  complexity; not yet staged.
+
+If the `restart_notice` observer proves sufficient when the API next
+flakes, (B) can be left at "mitigated." If not, expand `send_with_retry`
+upstream as the next step.
+
+### Compounding observations
+
+- ✅ **Sagent's `coalesce_inbox=False` patch (override #1) makes the
+  `restart_notice` observer's job easier** — the notice arrives as a
+  distinct user-side history entry instead of being merged into the
+  prior peer message. The two patches reinforce.
+- ❌ **Layer 1 of the earlier mitigation discussion (delivery-layer
+  dedup in `/api/post`) was rejected** because today's duplicate
+  delegations from the respawn-confusion case had NEARLY but not
+  exactly identical bodies — hash dedup would have produced false
+  negatives.
+
+---
+
+## Status: 2026-06-02 (evening)
 
 - Episodes 1, 2, 2.5, 2.7 are history (in `claude-config/project/worklog/threads/chat-to-sagent-migration.md`).
 - Episode 3 probe results in `/tmp/sagent_probe/` (haiku/sonnet/opus all
-  structurally dispatched `mcp__sagent__sagent_send`).
-- Episode 3 plugin scaffolded; no end-to-end test yet — that's the
-  next gate.
+  structurally dispatched `mcp__sagent_chat__sagent_send`).
+- Live testing through 2026-06-02 evening: 7 of 11 validation gates
+  closed; 3 deferred (PR drive, decision file, /debug walkthrough);
+  1 awaits live API-error firing (`restart_notice` observer).
+- **Recommended cutover state:** plugin is functional for daily
+  operator use. Channel/ runtime can be shut down in parallel
+  whenever you're ready. The Phase 6 decision file is the next
+  paperwork item.

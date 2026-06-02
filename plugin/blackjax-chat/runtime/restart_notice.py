@@ -9,33 +9,43 @@ subprocess when the API streams an aborted response
 2026-06-02). On respawn, sagent re-feeds the full ``agent.history``
 to the new subprocess. The conversation state isn't lost.
 
-What IS lost is the model's implicit "I'm in the middle of responding
-to msg B" pointer. The new subprocess re-reads the full history and
-makes a fresh choice about what to do next. With multiple
+What IS lost is the model's implicit "I was in the middle of
+responding to msg B" pointer. The new subprocess re-reads the full
+history and makes a fresh choice about what to do next. With multiple
 accumulated peer messages and an incomplete-looking trailing
 assistant turn (the one that died mid-stream), opus has a tendency
 to anchor on the LARGEST/EARLIEST identifiable user task and redo
 its prior work — re-issuing delegations, re-running tool searches,
-etc. Observed live 2026-06-02 12:53-12:58 (TL re-sent two delegation
-messages to SWE and statistician after three consecutive
-``ModelResponseError`` events).
+etc. Observed live 2026-06-02 12:53-12:58 and again 14:05-14:08.
 
 This observer interposes: when ``ModelResponseError`` fires, it
-pushes a synthetic :class:`UserMessage` with an orienting body into
-the agent's inbox. The next drain cycle picks it up, and with
-``coalesce_inbox=False`` it arrives as a discrete inbound the model
-can't ignore.
+walks ``agent.runtime.history`` backwards to find the agent's LAST
+productive activity (an ``AssistantMessage`` with either a
+``sagent_send`` tool call or non-empty text). Everything in history
+AFTER that point is the "catch-up zone" — inbounds that arrived
+since the agent was last productively engaged.
 
-Wording goals for the restart prompt
-------------------------------------
+The synthetic notice it pushes lists the catch-up-zone messages
+verbatim, in a "[handoff from previous session]" framing that beat
+the original "your subprocess restarted" framing in
+``/tmp/sagent_probe2/`` (P4 won out of 6 variants).
 
-- Tell the model EXPLICITLY that a respawn happened.
-- Anchor it to the most recent peer-side message instead of letting it
-  pick across all accumulated inbounds.
-- Tell it NOT to re-issue prior structured tool calls — those have
-  already executed.
-- Keep it short so it doesn't bloat the context that the model has to
-  re-read on every error.
+Why the wording matters
+-----------------------
+
+Probe at ``/tmp/sagent_probe2/`` against opus-4-8 found:
+
+  * "Your subprocess just restarted because…" → WRONG_ANCHOR
+    (opus reads as a problem state, decides to verify ground truth,
+    redoes prior tool calls)
+  * "[handoff from previous session] … the most recent message is
+    from @<src>: \"<verbatim text>\"" → CORRECT_ANCHOR
+    (opus reads as a fresh-context handoff, finds the answer source
+    in the conversation above, replies directly)
+
+The wording below replicates the winning framing, with the
+catch-up-zone enumeration as a generalisation for cases where
+multiple inbounds piled up.
 """
 
 from __future__ import annotations
@@ -46,58 +56,35 @@ from dataclasses import dataclass
 _LOG = logging.getLogger(__name__)
 
 
-# Body of the synthetic UserMessage pushed after a ModelResponseError.
-# Tuned to be: short, unambiguous, instruction-shaped. Tested first
-# 2026-06-02 against the TL-restart-confusion scenario.
-_RESTART_NOTICE = (
-    "[runtime restart notice — read carefully before acting]\n\n"
-    "Your claude subprocess just restarted because the previous turn's "
-    "API streaming errored out. The conversation above is your full "
-    "context — sagent re-fed it for you. Before taking any action:\n\n"
-    "1. Identify the MOST RECENT peer-side message in your history "
-    "(the inbound immediately above this notice, or above the synthetic "
-    "'(runtime: discrete-inbound boundary)' marker if one is present). "
-    "That is the message you should respond to.\n\n"
-    "2. Look at the assistant turns ABOVE that message. If you can see "
-    "evidence that you already issued structured tool calls "
-    "(`mcp__sagent_chat__sagent_send` etc.) or shell commands in "
-    "response to earlier user/peer messages, DO NOT re-issue those. "
-    "They have already been executed. The runtime preserves the audit "
-    "trail; assume what's in history actually happened.\n\n"
-    "3. If you cannot identify any in-flight task that needs your "
-    "response right now, briefly acknowledge to the most recent sender "
-    "via `mcp__sagent_chat__sagent_send` that you're back online and "
-    "waiting for direction.\n\n"
-    "4. Do NOT re-do worklog reads, file searches, or repo inspections "
-    "that you can see evidence of in your history. That work happened "
-    "in the prior subprocess; the results are already integrated.\n\n"
-    "Act ONLY on the most recent peer message. Resume now."
-)
+# Skip catch-up-zone events that ARE prior restart notices we
+# injected — otherwise the observer's own notices would be cited as
+# "unaddressed inbounds" by the next notice, producing a cascade.
+_NOTICE_TAG = "[handoff from previous session]"
 
 
 @dataclass
 class RestartNoticeObserver:
-    """Watch for ``ModelResponseError`` and push an orienting UserMessage.
+    """Watch for ``ModelResponseError`` and push a catch-up summary.
 
     Attach via ``agent.runtime.observers.append(observer)``. The
-    observer reads each event and acts only on ``ModelResponseError``.
+    observer reads each event and acts only on
+    ``ModelResponseError``.
     """
 
     agent_label: str
     """Label of the agent we observe (used for diagnostic logging only)."""
 
     def __call__(self, event) -> None:
-        from sagent.types.runtime import ModelResponseError, UserMessage
+        from sagent.types.runtime import (
+            AgentSendMessage,
+            AssistantMessage,
+            ModelResponseError,
+            UserMessage,
+        )
 
         if not isinstance(event, ModelResponseError):
             return
 
-        # Push the restart notice into THIS agent's own inbox. The
-        # runtime's drain loop picks it up as a UserMessage and the
-        # model treats it as a discrete inbound (with
-        # coalesce_inbox=False, it doesn't get merged into the prior
-        # peer message). It will be the LAST user-side entry in
-        # history when the new subprocess starts reading.
         from sagent.tools.core import agent_registry
 
         target = agent_registry.get(self.agent_label)
@@ -109,12 +96,96 @@ class RestartNoticeObserver:
             )
             return
 
-        _LOG.info(
-            "RestartNoticeObserver: ModelResponseError on @%s — "
-            "injecting restart-orient UserMessage",
-            self.agent_label,
+        # Read the full history at the moment of error.
+        history = getattr(target.runtime, "history", None) or []
+        if not history:
+            _LOG.info(
+                "RestartNoticeObserver: @%s history empty; skipping notice",
+                self.agent_label,
+            )
+            return
+
+        # Walk backwards to find the agent's last "productive activity":
+        # an AssistantMessage with EITHER a sagent_send tool call OR
+        # non-empty text. Everything AFTER this point is the catch-up
+        # zone (inbounds the agent hasn't successfully addressed yet).
+        catchup_start_idx = 0
+        for i in range(len(history) - 1, -1, -1):
+            entry = history[i]
+            if not isinstance(entry, AssistantMessage):
+                continue
+            tool_calls = getattr(entry, "tool_calls", None) or ()
+            had_send = any(
+                getattr(tc, "name", "") == "sagent_send"
+                for tc in tool_calls
+            )
+            had_text = bool((getattr(entry, "text", "") or "").strip())
+            if had_send or had_text:
+                catchup_start_idx = i + 1
+                break
+
+        # Collect unaddressed peer/user inbounds in the catch-up zone.
+        # Skip prior restart notices to prevent cascade re-citation.
+        unaddressed: list[tuple[str, str]] = []
+        for entry in history[catchup_start_idx:]:
+            if not isinstance(entry, (UserMessage, AgentSendMessage)):
+                continue
+            text = (getattr(entry, "text", "") or "").strip()
+            if not text or _NOTICE_TAG in text:
+                continue
+            src = getattr(entry, "source", None) or "user"
+            unaddressed.append((src, text))
+
+        if not unaddressed:
+            # No new inbounds to anchor on — silent restart.
+            _LOG.info(
+                "RestartNoticeObserver: @%s no catch-up inbounds; "
+                "silent restart",
+                self.agent_label,
+            )
+            return
+
+        # Format the catch-up summary. For a single inbound, quote it
+        # in the "most recent message" form (P4 wording). For multiple,
+        # enumerate.
+        if len(unaddressed) == 1:
+            src, text = unaddressed[0]
+            anchor = (
+                f"The most recent message in the conversation above is "
+                f"from @{src}:\n\n"
+                f"    \"{text}\"\n\n"
+                f"Your job: answer that message using the context above. "
+                f"Stay in plan mode. Don't re-do prior tool calls — "
+                f"assume what's in history actually happened."
+            )
+        else:
+            listed_lines = []
+            for i, (src, text) in enumerate(unaddressed, 1):
+                snippet = text if len(text) <= 400 else text[:400] + "…"
+                listed_lines.append(f"  {i}. @{src}: \"{snippet}\"")
+            listed = "\n".join(listed_lines)
+            anchor = (
+                f"The following messages arrived after your last "
+                f"successful send and haven't been addressed yet:\n\n"
+                f"{listed}\n\n"
+                f"Address them in order, using the context above. "
+                f"Don't re-do prior tool calls — they already executed."
+            )
+
+        body = (
+            f"{_NOTICE_TAG}\n\n"
+            f"Your prior session ran out of context mid-turn. A fresh "
+            f"session is now active, still in plan mode.\n\n"
+            f"{anchor}"
         )
-        target.runtime.inbox.push_back(UserMessage(text=_RESTART_NOTICE))
+
+        _LOG.info(
+            "RestartNoticeObserver: @%s ModelResponseError — injecting "
+            "handoff notice with %d catch-up inbound(s)",
+            self.agent_label,
+            len(unaddressed),
+        )
+        target.runtime.inbox.push_back(UserMessage(text=body))
 
 
 def install_on(agent, agent_label: str) -> RestartNoticeObserver:

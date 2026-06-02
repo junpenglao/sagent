@@ -184,6 +184,7 @@ class AnthropicCLI(Anthropic):
         max_request_tokens: int | None = None,
         *,
         extra_mcp_servers: dict[str, dict] | None = None,
+        session_id: str | None = None,
     ) -> _AnthropicCLIModel:
         """Build a CLI-backed model.
 
@@ -196,6 +197,18 @@ class AnthropicCLI(Anthropic):
             ``{"command": "...", "args": [...], "env": {...}}`` for
             stdio or ``{"type": "http", "url": "..."}`` for HTTP. Keys
             colliding with sagent's own bridge server name are dropped.
+          session_id: When set, every ``claude`` subprocess is spawned
+            with ``--session-id <uuid>`` (first turn) or
+            ``--resume <uuid>`` (subsequent turns) instead of
+            ``--no-session-persistence``. Sagent stops re-feeding
+            history via stdin: only the latest user-like inbound is
+            sent each turn, and ``claude`` itself owns the
+            conversation transcript at
+            ``~/.claude/projects/-<encoded-cwd>/<uuid>.jsonl``. This
+            mode is intended for chat-channel use cases where
+            ``aborted_streaming`` recoveries must NOT lose
+            ``AssistantMessage`` content — see
+            ``plugin/blackjax-chat/README.md`` for context.
 
         Returns:
           model: Backend wrapping a managed ``claude`` subprocess.
@@ -223,6 +236,7 @@ class AnthropicCLI(Anthropic):
                 else profile.max_request_tokens
             ),
             extra_mcp_servers=extra_mcp_servers,
+            session_id=session_id,
         )
 
     @override
@@ -260,6 +274,7 @@ class _AnthropicCLIModel:
         profile: ModelProfile,
         max_request_tokens: int,
         extra_mcp_servers: dict[str, dict] | None = None,
+        session_id: str | None = None,
     ) -> None:
         self._provider = provider
         self._model_id = model_id
@@ -271,10 +286,47 @@ class _AnthropicCLIModel:
         self._last_input_tokens = 0
         self._tools_bridge: ToolsBridge | None = None
         self._warming_proc: Subproc | None = None
-        self._hot_spare = HotSpare(
-            self._spawn_spare_initialized,
-            close_partial=self._close_warming_proc,
-        )
+        # Session-persistence mode (see ``AnthropicCLI.model``'s
+        # ``session_id`` arg). When set:
+        #   * ``--session-id <uuid>`` is passed on the first turn,
+        #     ``--resume <uuid>`` thereafter. ``claude`` owns history
+        #     at ``~/.claude/projects/-<encoded-cwd>/<uuid>.jsonl``.
+        #   * Sagent no longer re-feeds history via stdin: only the
+        #     latest user-like inbound is sent per turn.
+        #   * HotSpare is bypassed -- each ``stream`` call spawns a
+        #     fresh subprocess. Pre-warming a spare with
+        #     ``--resume <same-uuid>`` would race against in-flight
+        #     turns updating the session file (see the
+        #     ``/tmp/resume_probe/`` test A from 2026-06-02 evening:
+        #     concurrent ``--resume`` branches the conversation tree).
+        self._session_id: str | None = session_id
+        self._session_initialized: bool = False
+        if session_id is None:
+            self._hot_spare: HotSpare | None = HotSpare(
+                self._spawn_spare_initialized,
+                close_partial=self._close_warming_proc,
+            )
+            # Stateless mode mints a fresh tmpdir per spawn for
+            # credential isolation; the per-spawn tmpdir is local to
+            # ``_spawn_initialized``.
+            self._persistent_tmpdir: Path | None = None
+        else:
+            self._hot_spare = None
+            # Session-persistence mode: ``claude`` writes its session
+            # transcript to ``<HOME>/.claude/projects/-<encoded-cwd>/
+            # <uuid>.jsonl``. The stateless path's per-spawn tmpdir
+            # would orphan that file every turn -- ``--resume`` on the
+            # next spawn would point at a tmpdir with no projects/
+            # dir. So we mint ONE tmpdir at construction time, populate
+            # credentials once, and reuse it as ``HOME`` for every
+            # ``claude`` subprocess this model spawns.
+            self._persistent_tmpdir = Path(
+                tempfile.mkdtemp(prefix="sagent-anthropic-cli-resume-"),
+            )
+            _populate_anthropic_tmpdir(
+                self._persistent_tmpdir, self._provider.account,
+            )
+        self._active_proc: Subproc | None = None
         # Set by ``stream`` before ``_spawn_initialized`` reads them.
         self._pending_system: str = ""
         self._sent_history_head: TapeEvent | None = None
@@ -317,10 +369,16 @@ class _AnthropicCLIModel:
         cannot ``Detach``/``Kill`` individual tool calls; SIGINT to
         the subprocess is the only mid-turn cancellation surface.
         """
-        active = self._hot_spare.active
-        if active is None:
+        if self._hot_spare is not None:
+            active = self._hot_spare.active
+            if active is None:
+                return False
+            return active.interrupt()
+        # Session-persistence mode: HotSpare is bypassed; the active
+        # subprocess (if any) is on ``_active_proc``.
+        if self._active_proc is None:
             return False
-        return active.interrupt()
+        return self._active_proc.interrupt()
 
     @property
     def max_response_tokens(self) -> int:
@@ -491,6 +549,11 @@ class _AnthropicCLIModel:
 
         """
         self._pending_system = request.system or ""
+        if self._session_id is not None:
+            return await self._stream_session_persistent(
+                request, on_text, on_thinking,
+            )
+        assert self._hot_spare is not None  # stateless path
         if self._should_respawn(request):
             if _hash_system(request.system) != self._system_hash:
                 await self._hot_spare.discard_spare()
@@ -511,15 +574,92 @@ class _AnthropicCLIModel:
         self._turn_count += 1
         return response
 
+    async def _stream_session_persistent(
+        self,
+        request: ModelRequest,
+        on_text: Callable[[str], None] | None,
+        on_thinking: Callable[[str], None] | None,
+    ) -> ModelResponse:
+        """Drive one turn through a ``--session-id`` / ``--resume`` subprocess.
+
+        Spawn-on-demand (no HotSpare) because pre-warming a spare with
+        ``--resume <same-uuid>`` would race against the active
+        subprocess updating the session file (see
+        ``/tmp/resume_probe/`` test A from 2026-06-02: concurrent
+        ``--resume`` produces a branched conversation tree).
+
+        Only the newest user-like entries are written to stdin --
+        ``claude`` already has the rest in its session file.
+        ``_last_sent_index`` is the cumulative count of messages we've
+        delivered to ``claude`` across this session_id, NOT a per-
+        subprocess counter -- so it's preserved across transport-error
+        respawns. On the first turn we use ``--session-id``; on every
+        subsequent turn (including respawns) we use ``--resume``.
+        """
+        new_entries = request.messages[self._last_sent_index :]
+        user_like_entries: list[TapeEvent] = [
+            entry
+            for entry in new_entries
+            if not isinstance(entry, (AssistantMessage, ToolResult))
+        ]
+        if not user_like_entries:
+            # Nothing to send. Sagent's runtime should not reach this
+            # path on a normal turn -- surface loudly if it does.
+            raise RuntimeError(
+                "AnthropicCLI(session_persistent): stream() called with no "
+                "new user-like entries to send",
+            )
+        proc = await self._spawn_initialized()
+        self._active_proc = proc
+        self._sync_tools_bridge(request)
+        try:
+            for entry in user_like_entries[:-1]:
+                await self._send_entry(proc, entry)
+                _ = await self._drain_until_result(
+                    proc, on_text=None, on_thinking=None,
+                    update_input_tokens=False,
+                )
+            await self._send_entry(proc, user_like_entries[-1])
+            response = await self._drain_until_result(
+                proc, on_text, on_thinking,
+            )
+        except SubprocessTransportError:
+            # ``claude`` died mid-turn. Subsequent turns ``--resume`` the
+            # session that's on disk; whatever it managed to write is
+            # preserved. Don't reset ``_last_sent_index`` -- we still
+            # delivered everything up to ``user_like_entries[-1]`` to
+            # ``claude``'s session BEFORE it died (the user-line write
+            # to stdin happens before the model_call).
+            await proc.close()
+            self._active_proc = None
+            raise
+        else:
+            self._last_sent_index = len(request.messages)
+            # First successful turn established the session on disk;
+            # all future spawns use ``--resume``.
+            self._session_initialized = True
+            await proc.close()
+            self._active_proc = None
+            self._turn_count += 1
+            return response
+
     async def close(self) -> None:
         """Tear down the subprocess pool and the MCP bridge."""
-        await self._hot_spare.close()
+        if self._hot_spare is not None:
+            await self._hot_spare.close()
+        if self._active_proc is not None:
+            await self._active_proc.close()
+            self._active_proc = None
         if self._tools_bridge is not None:
             await self._tools_bridge.stop()
             self._tools_bridge = None
+        if self._persistent_tmpdir is not None and self._persistent_tmpdir.exists():
+            shutil.rmtree(self._persistent_tmpdir, ignore_errors=True)
+            self._persistent_tmpdir = None
 
     def _should_respawn(self, request: ModelRequest) -> bool:
         """Inspect the trigger list (§1.4) for this request."""
+        assert self._hot_spare is not None  # caller is the stateless path
         if self._hot_spare.active is None:
             return False
         history = request.messages
@@ -635,19 +775,38 @@ class _AnthropicCLIModel:
         if self._tools_bridge is None:
             self._tools_bridge = ToolsBridge(tools=[])
             await self._tools_bridge.start()
-        tmpdir = Path(tempfile.mkdtemp(prefix="sagent-anthropic-cli-"))
-        _populate_anthropic_tmpdir(tmpdir, self._provider.account)
+        if self._persistent_tmpdir is not None:
+            # Session-persistence mode: reuse the construction-time
+            # tmpdir so claude's session file persists across spawns.
+            # NB: the Subproc wrapper takes ownership of ``tmpdir`` for
+            # cleanup. We pass ``None`` (no per-spawn cleanup) and the
+            # model itself disposes of ``_persistent_tmpdir`` in
+            # ``close()``.
+            tmpdir = self._persistent_tmpdir
+            spawn_owned_tmpdir: Path | None = None
+        else:
+            tmpdir = Path(tempfile.mkdtemp(prefix="sagent-anthropic-cli-"))
+            _populate_anthropic_tmpdir(tmpdir, self._provider.account)
+            spawn_owned_tmpdir = tmpdir
         argv = _build_anthropic_argv(
             model_id=base_model_id(self._model_id),
             system_prompt=self._pending_system,
             bridge_url=self._tools_bridge.url,
             bridge_server_name=self._tools_bridge.server_name,
             extra_mcp_servers=self._extra_mcp_servers,
+            session_id=self._session_id,
+            # ``--resume`` once we've successfully spawned and ack'd
+            # at least one turn under this session_id; ``--session-id``
+            # otherwise. Updated in the session-persistence stream
+            # path on first successful drain.
+            resume_existing=self._session_initialized,
         )
         proc = Subproc(
             argv,
-            env=_anthropic_subprocess_env(tmpdir),
-            tmpdir=tmpdir,
+            env=_anthropic_subprocess_env(
+                tmpdir, persist_session=self._session_id is not None,
+            ),
+            tmpdir=spawn_owned_tmpdir,
         )
         self._warming_proc = proc
         try:
@@ -750,8 +909,17 @@ def _populate_anthropic_tmpdir(tmpdir: Path, account: str | None) -> None:
     target.chmod(0o600)
 
 
-def _anthropic_subprocess_env(tmpdir: Path) -> dict[str, str]:
-    """Build the env for the ``claude`` subprocess (telemetry off, hermetic HOME)."""
+def _anthropic_subprocess_env(
+    tmpdir: Path, *, persist_session: bool = False
+) -> dict[str, str]:
+    """Build the env for the ``claude`` subprocess (telemetry off, hermetic HOME).
+
+    When ``persist_session=True`` we keep ``CLAUDE_CODE_SKIP_PROMPT_HISTORY``
+    unset -- that env var (verified by bisect 2026-06-02) causes the CLI
+    to skip writing its session JSONL even when ``--session-id`` /
+    ``--resume`` are passed, which makes session-persistence mode silently
+    no-op and the next ``--resume`` fails with "No conversation found".
+    """
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     env.update(
         {
@@ -766,11 +934,12 @@ def _anthropic_subprocess_env(tmpdir: Path) -> dict[str, str]:
             "DISABLE_COST_WARNINGS": "1",
             "DISABLE_INSTALLATION_CHECKS": "1",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-            "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1",
             "CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP": "1",
             "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS": "1",
         }
     )
+    if not persist_session:
+        env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
     return env
 
 
@@ -781,8 +950,18 @@ def _build_anthropic_argv(
     bridge_url: str,
     bridge_server_name: str,
     extra_mcp_servers: dict[str, dict] | None = None,
+    session_id: str | None = None,
+    resume_existing: bool = False,
 ) -> list[str]:
     """Assemble the ``claude --print --input-format stream-json ...`` argv.
+
+    When ``session_id`` is ``None`` (default), passes
+    ``--no-session-persistence`` -- the historical behaviour. Otherwise
+    passes ``--session-id <uuid>`` (``resume_existing=False``) or
+    ``--resume <uuid>`` (``resume_existing=True``). Misusing this
+    (``--session-id`` on an existing session, ``--resume`` on a
+    nonexistent one) makes ``claude`` exit non-zero before consuming
+    stdin, which sagent surfaces as ``SubprocessTransportError``.
 
     ``extra_mcp_servers``, when provided, is merged into the
     ``mcpServers`` block of the JSON written to ``--mcp-config``. Use
@@ -802,7 +981,7 @@ def _build_anthropic_argv(
                 continue
             servers[name] = entry
     mcp_config = json.dumps({"mcpServers": servers})
-    return [
+    base = [
         "claude",
         "--print",
         "--input-format",
@@ -815,7 +994,18 @@ def _build_anthropic_argv(
         model_id,
         "--system-prompt",
         system_prompt,
-        "--no-session-persistence",
+    ]
+    if session_id is None:
+        # Stateless: every spawn is a fresh session, history is fed
+        # via stdin by ``_exchange_turn``.
+        base.append("--no-session-persistence")
+    elif resume_existing:
+        # Session-persistence mode, claude has the session on disk.
+        base.extend(["--resume", session_id])
+    else:
+        # Session-persistence mode, first time we see this UUID.
+        base.extend(["--session-id", session_id])
+    base.extend([
         "--setting-sources",
         "",
         "--mcp-config",
@@ -826,7 +1016,8 @@ def _build_anthropic_argv(
         "--disable-slash-commands",
         "--permission-mode",
         "bypassPermissions",
-    ]
+    ])
+    return base
 
 
 def _serialize_for_stdin(entry: TapeEvent, max_image_dim: int) -> MutableJSON:

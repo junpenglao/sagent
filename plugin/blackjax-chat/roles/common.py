@@ -111,7 +111,7 @@ def build_provider():
 def _sagent_mcp_server_entry(role: str) -> dict:
     """Per-role stdio MCP entry for the CLI's ``--mcp-config``.
 
-    Spawns ``mcp_sagent/server.py`` with two env vars:
+    Spawns ``mcp_sagent/server.py`` with three env vars:
 
       - ``SAGENT_ROLE``: the calling agent's label, used by the MCP
         server to attribute outgoing peer messages.
@@ -120,6 +120,10 @@ def _sagent_mcp_server_entry(role: str) -> dict:
         server runs in a SEPARATE Python process from ``serve.py``,
         so its in-process ``agent_registry`` is empty; HTTP is the
         only way to reach the live registry.
+      - ``SAGENT_DATA_DIR``: where ``main.jsonl``, the sentinel,
+        the debug log, and the per-role trace files live. Inherited
+        from the parent ``serve.py`` env so audit/data files
+        co-locate across the three-process tree.
     """
     import os
     import sys
@@ -127,13 +131,20 @@ def _sagent_mcp_server_entry(role: str) -> dict:
     from mcp_sagent.config_factory import SERVER_SCRIPT
 
     port = os.environ.get("SAGENT_HTTP_PORT", "8767")
+    env_out = {
+        "SAGENT_ROLE": role,
+        "SAGENT_HTTP_URL": f"http://127.0.0.1:{port}",
+    }
+    # Propagate the data dir only if explicitly set — if absent, both
+    # parent and child fall back to the plugin source dir, which
+    # matches anyway.
+    data_dir = os.environ.get("SAGENT_DATA_DIR")
+    if data_dir:
+        env_out["SAGENT_DATA_DIR"] = data_dir
     return {
         "command": sys.executable,
         "args": [str(SERVER_SCRIPT)],
-        "env": {
-            "SAGENT_ROLE": role,
-            "SAGENT_HTTP_URL": f"http://127.0.0.1:{port}",
-        },
+        "env": env_out,
     }
 
 

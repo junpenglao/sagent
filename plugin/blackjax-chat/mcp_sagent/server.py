@@ -73,7 +73,9 @@ _LOG = logging.getLogger("mcp_sagent.server")
 # reach us at all?" forensics — sagent's runtime trace doesn't see
 # external-MCP tool calls (those don't touch the bridge), so this is
 # the only authoritative log of what the model dispatched to us.
-_DEBUG_LOG = _PLUGIN_ROOT / "sessions" / "mcp_calls.log"
+# Lives in the same data dir as ``main.jsonl`` and the per-role
+# trace files — see :data:`delivery.DATA_DIR`.
+_DEBUG_LOG = delivery.SESSIONS_DIR / "mcp_calls.log"
 
 
 def _debug(msg: str) -> None:
@@ -107,7 +109,7 @@ _AGENT_ROLE = os.environ.get("SAGENT_ROLE", "operator")
 # subprocess of ``claude --print``, which is itself a subprocess of
 # ``serve.py``. Filesystem visibility is the only synchronisation
 # mechanism that all three layers share.
-_SUPPRESS_FLAG = Path(__file__).resolve().parent.parent / "sessions" / "_suppress_audit"
+_SUPPRESS_FLAG = delivery.SESSIONS_DIR / "_suppress_audit"
 
 
 def _suppress_audit() -> bool:

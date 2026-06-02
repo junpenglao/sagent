@@ -35,7 +35,31 @@ from typing import Iterable
 _LOG = logging.getLogger(__name__)
 
 
-MAIN_JSONL_PATH = Path(__file__).resolve().parent.parent / "main.jsonl"
+# Data directory: holds ``main.jsonl`` + the ``sessions/`` tree
+# (per-role traces, MCP configs, sentinel, debug log). Decoupled from
+# the plugin's source location so deployments can co-locate audit
+# data with sibling runtimes (e.g. ``channel/main.jsonl``) for unified
+# end-of-day merges. Resolution order:
+#
+#   1. ``SAGENT_DATA_DIR`` env var if set (canonical — set by
+#      ``serve.py`` at startup; propagated to MCP-server subprocesses
+#      via the per-role mcp.json ``env:`` block).
+#   2. Plugin source dir (default for casual/test runs).
+#
+# Module-level singleton: resolved once at import. Tests that need to
+# override should monkeypatch :data:`MAIN_JSONL_PATH` directly (and
+# any caller computing its own sessions path from the env should
+# re-read the env var, not this constant).
+def _resolve_data_dir() -> Path:
+    env = os.environ.get("SAGENT_DATA_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path(__file__).resolve().parent.parent
+
+
+DATA_DIR = _resolve_data_dir()
+MAIN_JSONL_PATH = DATA_DIR / "main.jsonl"
+SESSIONS_DIR = DATA_DIR / "sessions"
 
 
 # Base URL of the ``serve.py`` HTTP loopback. Set by

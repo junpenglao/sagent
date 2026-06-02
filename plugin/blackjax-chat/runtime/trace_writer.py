@@ -34,11 +34,20 @@ from pathlib import Path
 from typing import Any
 
 
-# Resolve to the plugin's top-level ``sessions/`` so trace files
-# co-locate with ``main.jsonl`` and the per-role ``*.mcp.json``
-# configs. The module lives under ``runtime/`` but the sessions dir
-# is at the plugin root (one level up).
-_SESSIONS_DIR = Path(__file__).resolve().parent.parent / "sessions"
+# Trace files co-locate with ``main.jsonl`` and the per-role
+# ``*.mcp.json`` configs in the plugin's *data* dir (configurable
+# via ``SAGENT_DATA_DIR``; see :mod:`mcp_sagent.delivery`). Imported
+# at module load — lives in the same Python process as ``serve.py``
+# so the env-resolved value reflects the launching process's
+# environment.
+import sys
+
+_plugin_root = Path(__file__).resolve().parent.parent
+if str(_plugin_root) not in sys.path:
+    sys.path.insert(0, str(_plugin_root))
+from mcp_sagent import delivery  # noqa: E402
+
+_SESSIONS_DIR = delivery.SESSIONS_DIR
 
 
 def _iso_now() -> str:

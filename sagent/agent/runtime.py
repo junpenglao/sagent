@@ -947,6 +947,7 @@ class AgentRuntime:
         compactor: Compactor | None = None,
         session_id: str = "",
         preempt_in_flight: bool = False,
+        coalesce_inbox: bool = True,
     ) -> None:
         self.model = model
         # When True, mid-stream UserMessage / AgentSendMessage attempts a
@@ -958,6 +959,22 @@ class AgentRuntime:
         # response is truncated to a ModelResponseError) and only the
         # caller knows whether that tradeoff is desired for this agent.
         self._preempt_in_flight = preempt_in_flight
+        # When True (default — the sagent-design behaviour), consecutive
+        # same-source ``UserMessage`` / ``AgentSendMessage`` items
+        # arriving without an intervening assistant turn are coalesced
+        # into a single history entry (see :meth:`_append_or_coalesce_user`).
+        # This satisfies Anthropic's user/assistant alternation rule when
+        # the model errored or was cancelled mid-turn.
+        #
+        # Set to False for chat-channel use cases where each peer
+        # ``AgentSendMessage`` is a deliberate discrete event that the
+        # recipient should process as a separate turn (e.g. a hard STOP
+        # arriving after a prior delegation message must be visible AS a
+        # distinct inbound, not concatenated to the tail of the prior
+        # one). When False, the coalesce path is replaced by an explicit
+        # synthetic assistant-turn boundary so the API alternation rule
+        # still holds.
+        self._coalesce_inbox = coalesce_inbox
         self.tools_map: dict[str, Tool] = {}
         for t in tools or []:
             if t.name in self.tools_map:
@@ -2690,10 +2707,34 @@ class AgentRuntime:
         Coalesce semantics: text joins with ``\n\n``; attachments
         concatenate in arrival order. The tail entry's ``id`` is
         preserved so downstream consumers keyed on ids remain stable.
+
+        When the owning :class:`AgentRuntime` was constructed with
+        ``coalesce_inbox=False`` (e.g. chat-channel runtimes where each
+        peer ``AgentSendMessage`` is a deliberate discrete event), the
+        coalesce path is replaced by injecting a synthetic empty
+        :class:`AssistantMessage` between the tail user-side message
+        and the new item, then appending the item as-is. The synthetic
+        assistant turn satisfies the API alternation rule without
+        hiding the new item inside the prior one — important when the
+        new item is e.g. a hard STOP that must be visible to the
+        recipient as a distinct inbound, not concatenated onto a tail
+        that the model has already started reasoning past.
         """
         resolved = self.context()
         messages = resolved.messages
         if not messages or wire_role(messages[-1]) != wire_role(item):
+            self.append_history(item)
+            return item
+        if not self._coalesce_inbox:
+            # Discrete-inbound mode: inject a synthetic empty
+            # assistant turn so each peer message remains a distinct
+            # history entry. The synthetic turn carries an explicit
+            # marker so downstream consumers (UI, audit, retrying
+            # providers) can recognise it as runtime-synthesized
+            # rather than a real model response.
+            self.append_history(
+                AssistantMessage(text="(runtime: discrete-inbound boundary)"),
+            )
             self.append_history(item)
             return item
         tail = messages[-1]

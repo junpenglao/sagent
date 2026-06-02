@@ -217,6 +217,7 @@ class Agent:
         provider_args: Mapping[str, object] | None = None,
         show_thinking: bool = True,
         preempt_in_flight: bool = False,
+        coalesce_inbox: bool = True,
     ) -> None:
         if max_attempts < 1:
             # ``send_with_retry``'s loop ``break``s on ``attempt >=
@@ -318,6 +319,7 @@ class Agent:
             compactor=self._agent_compactor,
             session_id=self._session_id,
             preempt_in_flight=preempt_in_flight,
+            coalesce_inbox=coalesce_inbox,
         )
 
         self.runtime.before_tool_spawn = self._before_tool_spawn

@@ -529,6 +529,47 @@ cost per turn vs the same agents on `channel/` doing equivalent work.
 
 ---
 
+## Comparison: `channel/` vs sagent+CLI vs sagent+API
+
+Three points in the design space. Today's plugin is the middle column.
+Column 1 is what we migrated away from. Column 3 is the next
+plausible step (direct Anthropic SDK calls instead of spawning
+`claude --print` subprocesses) and is speculative — not built.
+
+The dimensions below are the ones that actually moved the needle
+during live testing on 2026-06-02. Marker key: ✅ works /
+materially better, ⚠️ works but with caveats, ❌ broken or
+materially worse, 🔮 speculation (not measured).
+
+| Dimension | `channel/` (tmux runtime, migrated away from) | sagent + claude CLI (this plugin, today) | sagent + Anthropic SDK (speculative, not built) |
+|---|---|---|---|
+| **Process model** | ❌ One Python worker per agent, per tmux pane, per systemd cgroup. Cross-agent state via `main.jsonl` + polling. | ✅ Single process; one asyncio task per agent; in-process inbox. Operator runs one binary. | 🔮 Same single-process model; no subprocesses at all (no CLI to spawn). Smallest moving-part count of the three. |
+| **Cross-agent delivery latency** | ❌ 5–15 s gap per peer message (poll cycle + cold `claude --print` start). | ✅ Sub-second (`inbox.push_back` → recipient's warm subprocess picks up on next drain). | 🔮 Same sub-second — and no subprocess at all to wait on. |
+| **Per-turn token overhead** | ❌ 300–500 token reminder appended to every inbound directive (CLI session_id resets between turns; addressing convention has to be re-explained). | ✅ ~Zero marginal. Tool description (~80 tok) and system prompt (~200 tok) are part of the cached prefix; no per-message reminders. | 🔮 ~Zero marginal, same shape. Plus: full control over which blocks are marked `cache_control`, so we can pin the system + tools prefix with higher confidence. |
+| **Mid-turn cancellation / preempt** | ❌ `kill -9` the worker; no clean shutdown; partial stdout to `main.jsonl`. | ✅ `preempt_in_flight=True` sends SIGINT to the CLI subprocess; runtime publishes `ModelResponseCancelled`. Override #2. | 🔮 Native — close the SSE stream and call `stop_streaming()`; no signals, no subprocess race. |
+| **History feed on respawn** | ⚠️ New CLI session; full history re-fed via stdin including text-form assistant turns. | ⚠️ Sagent re-feeds history to a new `claude --print`, BUT `providers/anthropic_cli.py:537` strips ALL `AssistantMessage` entries before write. Respawned subprocess sees only user-side history. | ✅ History is just the `messages=` parameter to `client.messages.create(...)`. Assistant turns (text + `tool_use` blocks) and `tool_result` blocks all go in verbatim. No stripping. |
+| **Outbound visibility on respawn** | ✅ Outbound text survives the stdin re-feed (it's part of the assistant-turn text that *is* re-fed in channel/'s shape). | ❌→✅ Stripped by default (the consequence of #5 above; the silent-restart and re-delegation bugs traced back here). **Fixed in-plugin** by the `restart_notice` observer's splice-based reconstruction (override #3): on `ModelResponseError`, walk the tape, recover each prior `sagent_send`'s `args.to/content`, and `runtime.append_splice` a `[from sagent runtime] You previously sent to @X: "…"` after each peer reply. Equivalent to API-shape pairing, achieved through a workaround. | ✅ Free — outbound tool_use blocks are in `messages=` verbatim. No reconstruction needed. |
+| **`aborted_streaming` / `ede_diagnostic` recovery** | ❌ CLI dies; operator notices in tmux pane; manual restart. | ⚠️ Sagent auto-respawns the subprocess + observer pushes a handoff notice. Latency cost: full prompt-cache miss (sagent's byte fingerprint differs from claude's session-resume bytes). Wasted tokens per recovery. | 🔮 Honour the API's own `retry_delay_ms` (which we get in error responses today but aren't using); reissue the same call with the same `messages=`. Prompt cache hits stay warm. **Likely the biggest single token-cost win** if the API errors keep flaring like they did today. |
+| **Tool results in history** | ⚠️ Recreated from scratch each turn (one CLI session per turn). | ⚠️ Sagent's CLI provider treats tool round-trips as INTERNAL to the CLI subprocess — `ToolResult` entries in `agent.history` raise on the stdin path (`anthropic_cli.py:813-818`). Means we can never *replay* a prior turn's tool exchange; only fresh runs. | ✅ `tool_result` is a first-class user-message block; you can replay or seed history with it freely. |
+| **Prompt-cache hit rate across turns** | ❌ Low; CLI session reset on every turn = fresh cold cache. | ⚠️ Medium. Within a session, sagent re-feeds prior history each turn, but the byte fingerprint of the re-feed differs from claude's own session-resume bytes — so on respawn we eat a full cache miss. | 🔮 High and operator-controllable: we pick the cache-control breakpoints and the byte layout stays stable across turns. |
+| **Observability / debugging** | ⚠️ Manual log scraping; `main.jsonl` tail + per-pane stdout grep. | ✅ First-class HTTP surface: `/api/agents` (status + diagnosis), `/api/trace/<role>` (event-by-event runtime trace), `/debug` console, web UI with hidden bookkeeping events. | 🔮 Inherits the plugin's `/api/*` and traces unchanged — they observe runtime events, not the underlying transport. |
+| **Implementation complexity** | ❌ Highest. Per-pane workers, mention router, polling intervals, cgroup wiring, tmux orchestration. | ⚠️ Medium. Single binary, but three sagent overrides + an HTTP MCP bridge + an in-plugin observer were all needed to make it tolerable. | 🔮 Lowest. Direct SDK calls; no subprocess plumbing, no CLI session lifecycle, no `cli_publish_var` thread-local trickery. The current `restart_notice` observer becomes unnecessary. |
+| **Per-turn cost (input tokens)** | Baseline. | ✅ ~30% lower than `channel/` measured across the first hour of live use. | 🔮 Likely another 20–40% lower than CLI under organic API error pressure (no per-respawn cache miss); roughly on par on the happy path. |
+
+**Summary read.** Migrating `channel/` → sagent+CLI was a big win on
+the dimensions that hurt operators day-to-day (latency, token cost,
+observability). The price was inheriting two CLI-shape problems
+(history stripping; opaque retry behaviour on `aborted_streaming`)
+that we now mitigate in-plugin via overrides + the splice-based
+`restart_notice` observer. Moving sagent+CLI → sagent+API is
+plausible if the organic-error pressure stays elevated (it would
+delete the entire `restart_notice` complexity and reclaim the
+prompt-cache during recoveries) — but it's a larger build and would
+need a sagent core change (a non-CLI provider that doesn't strip
+`AssistantMessage`).
+
+---
+
 ## Validation status (as of 2026-06-02 evening)
 
 Gates closed by live testing today; open items + evidence below.

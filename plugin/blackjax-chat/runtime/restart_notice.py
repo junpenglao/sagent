@@ -7,64 +7,77 @@ Sagent's ``_AnthropicCLIModel`` respawns its ``claude --print``
 subprocess when the API streams an aborted response
 (``aborted_streaming`` / ``ede_diagnostic`` — both seen repeatedly on
 2026-06-02). On respawn, sagent re-feeds the full ``agent.history``
-to the new subprocess. The conversation state isn't lost.
+to the new subprocess … EXCEPT the ``AssistantMessage`` entries:
+``providers/anthropic_cli.py:537`` explicitly filters them out before
+writing to stdin. The new subprocess sees ONLY ``UserMessage`` and
+``AgentSendMessage`` entries.
 
-What IS lost is the model's implicit "I was in the middle of
-responding to msg B" pointer. The new subprocess re-reads the full
-history and makes a fresh choice about what to do next. With multiple
-accumulated peer messages and an incomplete-looking trailing
-assistant turn (the one that died mid-stream), opus has a tendency
-to anchor on the LARGEST/EARLIEST identifiable user task and redo
-its prior work — re-issuing delegations, re-running tool searches,
-etc. Observed live 2026-06-02 12:53-12:58 and again 14:05-14:08.
+That means the model's own prior outputs — text, ``sagent_send`` tool
+calls, internal ``Bash``/``Read``/``Glob`` tool calls — are
+**invisible** to the respawned subprocess. Peer replies look like
+they arrived "out of nowhere" with no triggering delegation. The
+fresh subprocess then has to guess what's going on from user-side
+messages alone, and the typical guess is "the original user task
+hasn't been started; let me delegate" — even when delegations have
+already happened and peer replies are already in.
 
-This observer interposes: when ``ModelResponseError`` fires, it
-walks ``agent.runtime.history`` backwards to find the agent's LAST
-productive activity (an ``AssistantMessage`` with either a
-``sagent_send`` tool call or non-empty text). Everything in history
-AFTER that point is the "catch-up zone" — inbounds that arrived
-since the agent was last productively engaged.
-
-The synthetic notice it pushes lists the catch-up-zone messages
-verbatim, in a "[handoff from previous session]" framing that beat
-the original "your subprocess restarted" framing in
-``/tmp/sagent_probe2/`` (P4 won out of 6 variants).
-
-Why the wording matters
+What this observer does
 -----------------------
 
-Probe at ``/tmp/sagent_probe2/`` against opus-4-8 found:
+When ``ModelResponseError`` fires, it walks ``runtime.tape``
+forward, tracking outbound ``sagent_send`` arguments from each
+``AssistantMessage`` it sees (mapping ``target → content``). For
+every ``AgentSendMessage`` it encounters from a peer whose source
+matches a known outbound, it ``runtime.append_splice``-es a
+synthetic ``UserMessage`` immediately AFTER the peer message
+reconstructing the prior outbound:
 
-  * "Your subprocess just restarted because…" → WRONG_ANCHOR
-    (opus reads as a problem state, decides to verify ground truth,
-    redoes prior tool calls)
-  * "[handoff from previous session] … the most recent message is
-    from @<src>: \"<verbatim text>\"" → CORRECT_ANCHOR
-    (opus reads as a fresh-context handoff, finds the answer source
-    in the conversation above, replies directly)
+    "[from sagent runtime] You previously sent to @{src}: \"<content>\""
 
-The wording below replicates the winning framing, with the
-catch-up-zone enumeration as a generalisation for cases where
-multiple inbounds piled up.
+These splices land in ``runtime.context().messages`` at the right
+chronological position (right after the peer reply), so the
+respawned CLI subprocess sees a clean alternation:
+
+    user: "<original task>"
+    user (from @swe): "<swe's reply>"
+    user: "[from sagent runtime] You previously sent to @swe: …"
+    user (from @statistician): "<stat's reply>"
+    user: "[from sagent runtime] You previously sent to @statistician: …"
+
+The model is no longer guessing what triggered the peer replies —
+it sees the (reconstructed) outbound right next to each one and
+naturally pairs them.
+
+The observer ALSO pushes a short ``UserMessage`` notice onto the
+inbox tagged ``[handoff from previous session]``. Because the
+conversation reconstruction is already in history, the notice's
+only job is to remind the respawned subprocess that the splices
+above are recovered context rather than fresh user input, and to
+point at the next action (synthesize, not re-delegate).
+
+Duplicate splices are avoided via ``_reconstructed_peer_refs`` —
+a per-observer set of peer ``TapeRef``s we've already spliced
+after. Subsequent ``ModelResponseError`` fires re-walk the tape
+but only splice new pairs.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 _LOG = logging.getLogger(__name__)
 
 
-# Skip catch-up-zone events that ARE prior restart notices we
-# injected — otherwise the observer's own notices would be cited as
-# "unaddressed inbounds" by the next notice, producing a cascade.
+# Tagged on the inbox UserMessage notice + on each splice payload so
+# we can identify them in history without false positives.
 _NOTICE_TAG = "[handoff from previous session]"
+_OUTBOUND_RECON_TAG = "[from sagent runtime] You previously sent"
 
 
 @dataclass
 class RestartNoticeObserver:
-    """Watch for ``ModelResponseError`` and push a catch-up summary.
+    """Watch for ``ModelResponseError`` and reconstruct outbound context.
 
     Attach via ``agent.runtime.observers.append(observer)``. The
     observer reads each event and acts only on
@@ -73,6 +86,11 @@ class RestartNoticeObserver:
 
     agent_label: str
     """Label of the agent we observe (used for diagnostic logging only)."""
+
+    _reconstructed_peer_refs: set = field(default_factory=set)
+    """``TapeRef`` of every ``AgentSendMessage`` we've already
+    spliced a reconstruction after. Prevents duplicate splices when
+    multiple ``ModelResponseError`` events fire in one session."""
 
     def __call__(self, event) -> None:
         from sagent.types.runtime import (
@@ -96,126 +114,158 @@ class RestartNoticeObserver:
             )
             return
 
-        # Read the full history at the moment of error. ``Agent.history`` is
-        # a @property that resolves to ``runtime.context().messages`` (see
-        # sagent/agent/agent.py:619). It is NOT a plain attribute on the
-        # runtime — reaching for ``target.runtime.history`` returns ``None``
-        # and silently degenerates to the "skip-silent-restart" path.
-        history = list(getattr(target, "history", None) or [])
-        if not history:
+        runtime = target.runtime
+        tape = getattr(runtime, "tape", None)
+        if not tape:
             _LOG.info(
-                "RestartNoticeObserver: @%s history empty; skipping notice",
+                "RestartNoticeObserver: @%s tape empty; nothing to "
+                "reconstruct",
                 self.agent_label,
             )
             return
 
-        # Walk backwards to find the agent's last "productive activity".
-        # An AssistantMessage counts as a productive boundary only when it
-        # represents OUTBOUND COMMUNICATION:
+        # Walk the tape forward, tracking the most recent outbound
+        # ``sagent_send`` content per target. When we hit an
+        # ``AgentSendMessage`` whose source matches a tracked outbound,
+        # splice a reconstruction note after it.
         #
-        #   (a) it contains a ``sagent_send`` tool call (peer/user message),
-        #       OR
-        #   (b) it contains non-empty text AND NO tool calls at all
-        #       (turn-ending text reply — the model finished and addressed
-        #       the inbound directly).
-        #
-        # An AssistantMessage with non-``sagent_send`` tool calls (``Bash``,
-        # ``Read``, ``Glob``, …) is INTERMEDIATE WORK, NOT a productive
-        # boundary. Treating intermediate tool-using turns as "addressed"
-        # was the source of the silent-restart false positive observed
-        # on 2026-06-02 17:58: after receiving swe + statistician replies,
-        # TL ran a single ``Bash find`` tool call and went idle WITHOUT
-        # consolidating + replying to the user — but the old walk-back
-        # stopped at that AssistantMessage and decided the catch-up zone
-        # was empty.
-        catchup_start_idx = 0
-        for i in range(len(history) - 1, -1, -1):
-            entry = history[i]
-            if not isinstance(entry, AssistantMessage):
+        # We dispatch on ``hasattr`` rather than ``isinstance`` to
+        # tolerate the tape having both ``ReferrableTapeEvent``
+        # (which has ``.event``) and ``ContextSplice`` (which has
+        # ``.payload``) records — we only care about the former.
+        last_outbound_per_peer: dict[str, str] = {}
+        splices_added = 0
+        already_reconstructed = 0
+        for record in tape:
+            entry = getattr(record, "event", None)
+            if entry is None:
+                # ContextSplice or another non-event tape record; skip.
                 continue
-            tool_calls = tuple(getattr(entry, "tool_calls", None) or ())
-            had_send = any(
-                getattr(tc, "name", "") == "sagent_send"
-                for tc in tool_calls
-            )
-            had_text_only = (
-                bool((getattr(entry, "text", "") or "").strip())
-                and not tool_calls
-            )
-            if had_send or had_text_only:
-                catchup_start_idx = i + 1
-                break
 
-        # Collect unaddressed peer/user inbounds in the catch-up zone.
-        # Skip:
-        #   * prior restart notices (cascade prevention),
-        #   * the runtime-synthesised ``"[Error: …]"`` UserMessage that
-        #     ``agent/runtime.py:1650`` appends when handling
-        #     ModelResponseError — it sits in history right before our
-        #     observer fires and isn't a real inbound the agent needs to
-        #     address; citing it would inject a self-reference loop.
-        unaddressed: list[tuple[str, str]] = []
-        for entry in history[catchup_start_idx:]:
-            if not isinstance(entry, (UserMessage, AgentSendMessage)):
+            if isinstance(entry, AssistantMessage):
+                for tc in getattr(entry, "tool_calls", None) or ():
+                    if getattr(tc, "name", "") != "sagent_send":
+                        continue
+                    args = getattr(tc, "args", None) or {}
+                    to = args.get("to")
+                    content = args.get("content", "") or ""
+                    if not isinstance(content, str) or not content.strip():
+                        continue
+                    if isinstance(to, list):
+                        for label in to:
+                            if isinstance(label, str) and label:
+                                last_outbound_per_peer[label] = content
+                    elif isinstance(to, str) and to:
+                        last_outbound_per_peer[to] = content
                 continue
-            text = (getattr(entry, "text", "") or "").strip()
-            if not text or _NOTICE_TAG in text:
-                continue
-            if text.startswith("[Error:"):
-                continue
-            src = getattr(entry, "source", None) or "user"
-            unaddressed.append((src, text))
 
-        if not unaddressed:
-            # No new inbounds to anchor on — silent restart.
+            if isinstance(entry, AgentSendMessage):
+                src = getattr(entry, "source", None)
+                if not src or src == self.agent_label:
+                    continue
+                # Skip if we've already spliced this peer ref. We still
+                # consume the outbound (pop) so it doesn't show up as an
+                # "orphan" in the notice on every re-fire.
+                ref = getattr(record, "ref", None)
+                if ref is not None and ref in self._reconstructed_peer_refs:
+                    last_outbound_per_peer.pop(src, None)
+                    already_reconstructed += 1
+                    continue
+                outbound = last_outbound_per_peer.pop(src, None)
+                if outbound is None:
+                    continue
+
+                # Trim very long outbound bodies so the splice doesn't
+                # bloat the context window. The full content is still in
+                # the (stripped) AssistantMessage's tool_calls; this is
+                # an aide-memoire, not the source of truth.
+                snippet = outbound if len(outbound) <= 800 else outbound[:800] + "…"
+                note = UserMessage(
+                    text=f'{_OUTBOUND_RECON_TAG} to @{src}: "{snippet}"',
+                )
+                try:
+                    runtime.append_splice(
+                        insert_after=ref,
+                        payload=(note,),
+                        strategy="restart_notice.outbound_reconstruction",
+                        fallback_reason=(
+                            "reconstruct stripped AssistantMessage's "
+                            "sagent_send tool call for respawned subprocess"
+                        ),
+                    )
+                    if ref is not None:
+                        self._reconstructed_peer_refs.add(ref)
+                    splices_added += 1
+                except Exception as exc:  # noqa: BLE001 -- best-effort
+                    _LOG.warning(
+                        "RestartNoticeObserver: @%s splice failed for "
+                        "peer @%s: %s",
+                        self.agent_label,
+                        src,
+                        exc,
+                    )
+
+        # Outbounds that never matched an inbound are still "in flight"
+        # (peer hasn't replied yet). We don't splice for those — there's
+        # no peer message to anchor after.
+        orphan_outbounds = list(last_outbound_per_peer.items())
+
+        # Always push a short orienting notice onto the inbox so the
+        # respawned subprocess KNOWS the splices in history are
+        # reconstructed context rather than fresh user input.
+        if splices_added == 0 and not orphan_outbounds:
             _LOG.info(
-                "RestartNoticeObserver: @%s no catch-up inbounds; "
+                "RestartNoticeObserver: @%s nothing to reconstruct; "
                 "silent restart",
                 self.agent_label,
             )
             return
 
-        # Format the catch-up summary. For a single inbound, quote it
-        # in the "most recent message" form (P4 wording). For multiple,
-        # enumerate.
-        if len(unaddressed) == 1:
-            src, text = unaddressed[0]
-            anchor = (
-                f"The most recent message in the conversation above is "
-                f"from @{src}:\n\n"
-                f"    \"{text}\"\n\n"
-                f"Your job: answer that message using the context above. "
-                f"Stay in plan mode. Don't re-do prior tool calls — "
-                f"assume what's in history actually happened."
+        parts = [
+            _NOTICE_TAG,
+            "",
+            "Your prior session aborted mid-turn. A fresh subprocess "
+            "is now active.",
+            "",
+            "Important: sagent strips your prior AssistantMessages "
+            "when re-feeding history to a respawned subprocess "
+            "(providers/anthropic_cli.py:537), so your prior text and "
+            "tool calls are NOT visible to you in this session.",
+            "",
+        ]
+        if splices_added > 0:
+            parts.append(
+                f"To compensate, sagent has spliced {splices_added} "
+                f"\"{_OUTBOUND_RECON_TAG} to @<peer>: …\" UserMessages "
+                "into history above. Each one appears right after the "
+                "peer reply it triggered. Treat these as RECOVERED "
+                "context, not fresh instructions."
             )
-        else:
-            listed_lines = []
-            for i, (src, text) in enumerate(unaddressed, 1):
-                snippet = text if len(text) <= 400 else text[:400] + "…"
-                listed_lines.append(f"  {i}. @{src}: \"{snippet}\"")
-            listed = "\n".join(listed_lines)
-            anchor = (
-                f"The following messages arrived after your last "
-                f"successful send and haven't been addressed yet:\n\n"
-                f"{listed}\n\n"
-                f"Address them in order, using the context above. "
-                f"Don't re-do prior tool calls — they already executed."
+            parts.append("")
+            parts.append(
+                "Your next action: synthesize the peer replies into a "
+                "single response to the original user request. Do NOT "
+                "re-issue any sagent_send to peers you've already "
+                "delegated to — their replies are above."
             )
+        if orphan_outbounds:
+            parts.append("")
+            parts.append("Pending delegations (no peer reply yet):")
+            for label, content in orphan_outbounds:
+                snippet = content if len(content) <= 240 else content[:240] + "…"
+                parts.append(f"  - @{label}: \"{snippet}\"")
 
-        body = (
-            f"{_NOTICE_TAG}\n\n"
-            f"Your prior session ran out of context mid-turn. A fresh "
-            f"session is now active, still in plan mode.\n\n"
-            f"{anchor}"
-        )
-
+        body = "\n".join(parts)
         _LOG.info(
-            "RestartNoticeObserver: @%s ModelResponseError — injecting "
-            "handoff notice with %d catch-up inbound(s)",
+            "RestartNoticeObserver: @%s ModelResponseError — spliced "
+            "%d outbound reconstruction(s) (%d already-done skipped, "
+            "%d orphan outbound(s)); pushing handoff notice",
             self.agent_label,
-            len(unaddressed),
+            splices_added,
+            already_reconstructed,
+            len(orphan_outbounds),
         )
-        target.runtime.inbox.push_back(UserMessage(text=body))
+        runtime.inbox.push_back(UserMessage(text=body))
 
 
 def install_on(agent, agent_label: str) -> RestartNoticeObserver:

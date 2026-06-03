@@ -300,7 +300,15 @@ class _AnthropicCLIModel:
         #     ``/tmp/resume_probe/`` test A from 2026-06-02 evening:
         #     concurrent ``--resume`` branches the conversation tree).
         self._session_id: str | None = session_id
-        self._session_initialized: bool = False
+        # ``_session_initialized = True`` means "claude already has a
+        # session JSONL for this uuid on disk, use ``--resume``"; False
+        # means "first time we've seen this uuid, use ``--session-id``".
+        # We probe the operator's real ``~/.claude/projects/`` at
+        # construction time so server restarts pick up prior
+        # conversations transparently.
+        self._session_initialized: bool = (
+            session_id is not None and _session_jsonl_exists(session_id)
+        )
         if session_id is None:
             self._hot_spare: HotSpare | None = HotSpare(
                 self._spawn_spare_initialized,
@@ -623,6 +631,29 @@ class _AnthropicCLIModel:
         respawns. On the first turn we use ``--session-id``; on every
         subsequent turn (including respawns) we use ``--resume``.
         """
+        # ``agent.clear()`` (driven by ``/api/restart``, ``Clear`` event,
+        # or context-overflow recovery) wipes ``runtime.context().messages``
+        # but doesn't reach into the provider's ``_last_sent_index`` /
+        # ``_session_initialized``. After clear, the runtime keeps calling
+        # ``stream()`` -- with an empty ``request.messages`` until new
+        # input arrives. The stateless path handles this in
+        # ``_should_respawn`` (history shrunk → respawn → reset
+        # counters); we have to do the equivalent here. Otherwise:
+        #
+        # * The defensive "no new user-like entries" guard fires and
+        #   crashes the runtime turn.
+        # * Even if we let an empty turn through, the next real
+        #   ``--session-id <uuid>`` call would fail with "Session ID
+        #   is already in use" because claude's prior session JSONL
+        #   is still on disk.
+        #
+        # Detect via ``self._last_sent_index > len(request.messages)``
+        # (cumulative-count > current-history-length is only possible
+        # after a clear). Reset state, delete the stale on-disk JSONL,
+        # then continue as if this is a fresh session.
+        if self._last_sent_index > len(request.messages):
+            self._reset_for_clear()
+
         new_entries = request.messages[self._last_sent_index :]
         user_like_entries: list[TapeEvent] = [
             entry
@@ -630,11 +661,14 @@ class _AnthropicCLIModel:
             if not isinstance(entry, (AssistantMessage, ToolResult))
         ]
         if not user_like_entries:
-            # Nothing to send. Sagent's runtime should not reach this
-            # path on a normal turn -- surface loudly if it does.
-            raise RuntimeError(
-                "AnthropicCLI(session_persistent): stream() called with no "
-                "new user-like entries to send",
+            # No new input to feed. Return a no-op response: empty
+            # assistant message + zero usage. The runtime treats this
+            # as a finished turn with no output; the next real inbound
+            # will spawn the next subprocess. Cheaper than spawning a
+            # claude --print just to wait for stdin EOF.
+            return ModelResponse(
+                message=AssistantMessage(text="", tool_calls=()),
+                stop_reason="model_finished",
             )
         # Bridge MUST be populated before the subprocess spawns: the
         # CLI issues ``ListToolsRequest`` against the bridge soon
@@ -898,6 +932,46 @@ class _AnthropicCLIModel:
         self._last_input_tokens = 0
         self._reset_delta_state()
 
+    def _reset_for_clear(self) -> None:
+        """Reset session-persistent state after ``agent.clear()``.
+
+        Wipes the cumulative-sent counter, marks the session as
+        uninitialised (next spawn will use ``--session-id`` again),
+        and DELETES the on-disk session JSONL so the next
+        ``--session-id <same-uuid>`` call doesn't error with
+        "Session ID is already in use".
+
+        Called from :meth:`_stream_session_persistent` when it
+        detects ``_last_sent_index > len(request.messages)``, which
+        is the post-``Clear`` shape.
+        """
+        if self._session_id is None:
+            return
+        self._last_sent_index = 0
+        self._session_initialized = False
+        # Find + delete the session JSONL. Path:
+        #   <HOME>/.claude/projects/-<encoded-cwd>/<uuid>.jsonl
+        # where HOME is either the persistent tmpdir (per-account
+        # mode) or the operator's real $HOME (single-account mode).
+        home = self._persistent_tmpdir or Path(os.environ.get("HOME", "~")).expanduser()
+        projects = home / ".claude" / "projects"
+        if not projects.exists():
+            return
+        # The cwd-encoded subdir is opaque to us (claude picks the
+        # encoding); glob across all subdirs for safety.
+        for jsonl in projects.glob(f"*/{self._session_id}.jsonl"):
+            try:
+                jsonl.unlink()
+                logger.info(
+                    "AnthropicCLI(session_persistent): cleared session "
+                    "JSONL at %s after agent.clear()", jsonl,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "AnthropicCLI(session_persistent): failed to delete "
+                    "%s: %s", jsonl, exc,
+                )
+
     def _reset_delta_state(self) -> None:
         """Reset sent-history delta tracking."""
         self._last_sent_index = 0
@@ -969,6 +1043,29 @@ def _load_cli_credentials_file(path: Path) -> AnthropicCLICredentials | None:
     if validate_json_schema(_CREDENTIALS_SCHEMA, raw):
         return None
     return _parse_cli_credentials(raw)
+
+
+def _session_jsonl_exists(session_id: str) -> bool:
+    """Check whether claude already has a session transcript for this
+    uuid on disk (under the operator's real HOME).
+
+    Used at construction time so that on ``serve.py`` restart we
+    pick the right initial flag: ``--resume`` (the JSONL exists, we
+    continue the prior conversation) vs ``--session-id`` (no prior
+    session, we establish a fresh one). Picking the wrong one makes
+    ``claude --print`` exit non-zero before consuming stdin --
+    ``--session-id`` on an existing session errors with "Session ID
+    is already in use", ``--resume`` on a nonexistent one errors
+    with "No conversation found".
+    """
+    home = Path(os.environ.get("HOME", "~")).expanduser()
+    projects = home / ".claude" / "projects"
+    if not projects.exists():
+        return False
+    # The cwd-encoded subdir is opaque to us; glob across all of them.
+    for _ in projects.glob(f"*/{session_id}.jsonl"):
+        return True
+    return False
 
 
 def _populate_anthropic_tmpdir(tmpdir: Path, account: str | None) -> None:

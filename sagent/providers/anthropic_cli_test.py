@@ -423,6 +423,126 @@ async def test_session_persistent_stream_returns_empty_when_history_cleared(
     assert not jsonl.exists()
 
 
+@pytest.mark.asyncio
+async def test_session_persistent_advances_sent_index_per_entry_on_partial_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for 2026-06-03 ~14:30 SWE bug: when multiple new
+    user-like entries are queued and the drain aborts partway through,
+    ``_last_sent_index`` must reflect every entry already WRITTEN to
+    stdin -- not just the entries whose drain completed.
+
+    Otherwise the next ``--resume`` re-writes the entries that already
+    landed in claude's session JSONL (producing duplicates) AND fails
+    to reach the entries that came after the abort point (silently
+    dropping them). The SWE symptom was an early "Great smoke" inbound
+    appearing 3× in the session JSONL while five subsequent TL STOP
+    directives never appeared at all.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from sagent.providers.lib.subproc import SubprocessTransportError
+    from sagent.types.runtime import AgentSendMessage
+
+    _write_creds(tmp_path)
+    monkeypatch.setattr(
+        "sagent.providers.anthropic_cli._CREDS_PATH",
+        tmp_path / ".credentials.json",
+    )
+    monkeypatch.setattr(
+        "sagent.providers.anthropic_cli.shutil.which",
+        lambda name: "/usr/bin/claude",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    sid = "deadbeef-1234-5678-9abc-deadbeef1234"
+    provider = AnthropicCLI.from_credentials()
+    model = provider.model("claude-haiku-4-5", session_id=sid)
+    # Pretend a turn already landed so we're past the first-spawn case.
+    model._session_initialized = True
+    model._last_sent_index = 5
+
+    # Replace the heavy I/O with mocks:
+    #   * _ensure_tools_bridge / _sync_tools_bridge: no-op
+    #   * _spawn_initialized: returns a fake proc
+    #   * _send_entry: records the entry written
+    #   * _drain_until_result: returns OK on the first call (entry index
+    #     5 succeeds end-to-end), raises SubprocessTransportError on the
+    #     second (simulating aborted_streaming on the second entry's
+    #     model_call)
+    bridge_calls: list[object] = []
+    sent_entries: list[TapeEvent] = []
+
+    async def _ensure() -> None:
+        bridge_calls.append("ensure")
+    model._ensure_tools_bridge = _ensure  # ty: ignore[invalid-assignment]
+    model._sync_tools_bridge = lambda r: bridge_calls.append(("sync", r))  # ty: ignore[invalid-assignment]
+
+    fake_proc = MagicMock()
+    fake_proc.close = AsyncMock()
+    model._spawn_initialized = AsyncMock(return_value=fake_proc)  # ty: ignore[invalid-assignment]
+
+    async def _send_entry(proc: object, entry: TapeEvent) -> None:
+        del proc
+        sent_entries.append(entry)
+    model._send_entry = _send_entry  # ty: ignore[invalid-assignment]
+
+    drain_calls = 0
+    async def _drain(proc: object, on_text=None, on_thinking=None,
+                     update_input_tokens: bool = True):  # noqa: ANN001
+        del proc, on_text, on_thinking, update_input_tokens
+        nonlocal drain_calls
+        drain_calls += 1
+        if drain_calls == 1:
+            # First drain (for the FIRST entry) succeeds: this would be
+            # the equivalent of "Great smoke" being acknowledged.
+            return ModelResponse(
+                message=AssistantMessage(text="ack 1", tool_calls=()),
+                stop_reason="model_finished",
+            )
+        # Second drain (for the SECOND entry) aborts mid-stream: this
+        # is the equivalent of the aborted_streaming on the abort cycle
+        # that prevented TL's STOP from being processed in production.
+        raise SubprocessTransportError("simulated abort on entry 2")
+    model._drain_until_result = _drain  # ty: ignore[invalid-assignment]
+
+    # Three entries queued. _last_sent_index = 5 means request.messages
+    # has 8 entries; entries 5, 6, 7 are the new user-like ones.
+    msg_E1 = AgentSendMessage(source="tl", text="entry 1 — should land cleanly")
+    msg_E2 = AgentSendMessage(source="tl", text="entry 2 — drain aborts on this one")
+    msg_E3 = AgentSendMessage(source="tl", text="entry 3 — STOP directive that must NOT be lost")
+    request = ModelRequest(
+        system="x",
+        messages=(
+            UserMessage(text="old turn 1"),
+            UserMessage(text="old turn 2"),
+            UserMessage(text="old turn 3"),
+            UserMessage(text="old turn 4"),
+            UserMessage(text="old turn 5"),
+            msg_E1,
+            msg_E2,
+            msg_E3,
+        ),
+        tools=(),
+    )
+
+    with pytest.raises(SubprocessTransportError):
+        await model.stream(request, on_text=None, on_thinking=None)
+
+    # Both E1 and E2 were written to stdin before the drain raised on
+    # E2's model_call. E3 was NOT written -- the loop short-circuited.
+    assert sent_entries == [msg_E1, msg_E2]
+
+    # The CRITICAL regression assertion: _last_sent_index now reflects
+    # both writes (5 + 2 entries = position 7, pointing at E3 which is
+    # the FIRST entry the next --resume must deliver).
+    # Pre-fix behaviour would have left _last_sent_index at 5, causing
+    # the next retry to re-write E1 (duplicate in claude's session) and
+    # re-attempt the same drain abort sequence, leaving E3 perpetually
+    # stranded.
+    assert model._last_sent_index == 7
+
+
 def test_model_session_initialized_probes_disk_at_construction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

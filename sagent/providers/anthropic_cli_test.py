@@ -337,15 +337,20 @@ def test_dispatch_stream_event_routes_text_and_thinking() -> None:
     thinking_parts: list[str] = []
     text_chunks: list[str] = []
     thinking_chunks: list[str] = []
-    text_event = cast(MutableJSON, {"delta": {"type": "text_delta", "text": "hello"}})
+    tool_use_blocks: dict[int, dict[str, object]] = {}
+    text_event = cast(
+        MutableJSON,
+        {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hello"}},
+    )
     thinking_event = cast(
         MutableJSON,
-        {"delta": {"type": "thinking_delta", "thinking": "reflecting"}},
+        {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "reflecting"}},
     )
     _dispatch_stream_event(
         text_event,
         text_parts,
         thinking_parts,
+        tool_use_blocks,
         on_text=text_chunks.append,
         on_thinking=thinking_chunks.append,
     )
@@ -353,6 +358,7 @@ def test_dispatch_stream_event_routes_text_and_thinking() -> None:
         thinking_event,
         text_parts,
         thinking_parts,
+        tool_use_blocks,
         on_text=text_chunks.append,
         on_thinking=thinking_chunks.append,
     )
@@ -362,14 +368,118 @@ def test_dispatch_stream_event_routes_text_and_thinking() -> None:
     assert thinking_chunks == ["reflecting"]
 
 
+def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
+    """tool_use is published at content_block_stop with name + arg
+    summary, after the streamed input_json_delta has been accumulated."""
+    from sagent.agent.runtime import cli_publish_var
+    from sagent.types.runtime import ToolLabel
+
+    published: list[object] = []
+    token = cli_publish_var.set(published.append)
+    try:
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_use_blocks: dict[int, dict[str, object]] = {}
+        # 1) start: registers tool_use at index 0 -- NO label published yet
+        _dispatch_stream_event(
+            cast(
+                MutableJSON,
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_abc123",
+                        "name": "Bash",
+                        "input": {},
+                    },
+                },
+            ),
+            text_parts, thinking_parts, tool_use_blocks,
+            on_text=None, on_thinking=None,
+        )
+        assert published == []  # nothing yet -- we wait for args
+        # 2) deltas: stream the JSON in two chunks
+        for partial in ('{"command":"ls', ' -la"}'):
+            _dispatch_stream_event(
+                cast(
+                    MutableJSON,
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "input_json_delta", "partial_json": partial},
+                    },
+                ),
+                text_parts, thinking_parts, tool_use_blocks,
+                on_text=None, on_thinking=None,
+            )
+        assert published == []  # still nothing
+        # 3) stop: now we publish the rich label
+        _dispatch_stream_event(
+            cast(
+                MutableJSON,
+                {"type": "content_block_stop", "index": 0},
+            ),
+            text_parts, thinking_parts, tool_use_blocks,
+            on_text=None, on_thinking=None,
+        )
+    finally:
+        cli_publish_var.reset(token)
+    assert len(published) == 1
+    label = published[0]
+    assert isinstance(label, ToolLabel)
+    # Includes both the tool name and the command arg
+    assert label.text == "Bash ls -la"
+    assert label.call_id == "toolu_abc123"
+
+
+def test_dispatch_stream_event_no_label_for_text_block_start() -> None:
+    """``content_block_start`` for ``text`` does NOT publish a ToolLabel."""
+    from sagent.agent.runtime import cli_publish_var
+
+    published: list[object] = []
+    token = cli_publish_var.set(published.append)
+    try:
+        tool_use_blocks: dict[int, dict[str, object]] = {}
+        _dispatch_stream_event(
+            cast(
+                MutableJSON,
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ),
+            [], [], tool_use_blocks,
+            on_text=None, on_thinking=None,
+        )
+        # And a content_block_stop on the text block: no label.
+        _dispatch_stream_event(
+            cast(MutableJSON, {"type": "content_block_stop", "index": 1}),
+            [], [], tool_use_blocks,
+            on_text=None, on_thinking=None,
+        )
+    finally:
+        cli_publish_var.reset(token)
+    assert published == []
+
+
 def test_dispatch_stream_event_ignores_unknown_delta_types() -> None:
     """A non-text/thinking delta does not perturb the accumulators."""
     text_parts: list[str] = []
     thinking_parts: list[str] = []
+    tool_use_blocks: dict[int, dict[str, object]] = {}
     _dispatch_stream_event(
-        cast(MutableJSON, {"delta": {"type": "signature_delta", "signature": "x"}}),
+        cast(
+            MutableJSON,
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "signature_delta", "signature": "x"},
+            },
+        ),
         text_parts,
         thinking_parts,
+        tool_use_blocks,
         on_text=None,
         on_thinking=None,
     )

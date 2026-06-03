@@ -82,6 +82,18 @@ class Subproc:
           RuntimeError: If the executable is not on ``PATH``.
 
         """
+        # ``limit`` raises asyncio.StreamReader's per-line buffer above
+        # the default 64 KiB. ``claude --print --output-format stream-json``
+        # emits ONE NDJSON record per content block; a single Read of a
+        # large file echoes the file's content verbatim into one line
+        # (worklog threads of 40+ KiB are routine in our chat use case).
+        # 64 KiB caps stranded ``readline()`` with
+        # "ValueError: Separator is found, but chunk is longer than
+        # limit" -- diagnosed by TL via the live chat 2026-06-03, after
+        # back-to-back reads of chat-to-sagent-migration.md (~41 KiB) +
+        # benchmark-regression-criterion.md (~22 KiB) tripped it. 16 MiB
+        # is comfortably above any single stream-json record we expect
+        # while keeping memory bounded.
         self._proc = await asyncio.create_subprocess_exec(
             *self._argv,
             stdin=asyncio.subprocess.PIPE,
@@ -89,6 +101,7 @@ class Subproc:
             stderr=asyncio.subprocess.PIPE,
             env=self._env,
             cwd=str(self._cwd) if self._cwd is not None else None,
+            limit=16 * 1024 * 1024,
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._stderr_task.add_done_callback(

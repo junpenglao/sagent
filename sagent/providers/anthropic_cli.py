@@ -655,12 +655,13 @@ class _AnthropicCLIModel:
             self._reset_for_clear()
 
         new_entries = request.messages[self._last_sent_index :]
-        user_like_entries: list[TapeEvent] = [
-            entry
-            for entry in new_entries
-            if not isinstance(entry, (AssistantMessage, ToolResult))
-        ]
-        if not user_like_entries:
+        # user-like entries only: filter out AssistantMessage / ToolResult
+        # (sagent's own history bookkeeping, never written to stdin).
+        # We build the index map below at the same time we'd otherwise
+        # build the list.
+        if not any(
+            not isinstance(e, (AssistantMessage, ToolResult)) for e in new_entries
+        ):
             # No new input to feed. Return a no-op response: empty
             # assistant message + zero usage. The runtime treats this
             # as a finished turn with no output; the next real inbound
@@ -678,32 +679,59 @@ class _AnthropicCLIModel:
         # — observed 2026-06-02 23:16 when TL produced
         # "Bash {command: ls -la …}" as text instead of a tool_use
         # block on the first turn after refactor).
+        # Per-entry index map: each user-like entry's position in
+        # ``new_entries`` (which is ``request.messages[base:]``). We
+        # use this to advance ``_last_sent_index`` per-entry as the
+        # writes succeed, so a mid-loop ``SubprocessTransportError``
+        # doesn't lose the entries we already wrote and doesn't force
+        # the next retry to re-send them.
+        new_entries_idx: list[tuple[int, TapeEvent]] = []
+        for i, entry in enumerate(new_entries):
+            if not isinstance(entry, (AssistantMessage, ToolResult)):
+                new_entries_idx.append((i, entry))
+        base = self._last_sent_index
+
         await self._ensure_tools_bridge()
         self._sync_tools_bridge(request)
         proc = await self._spawn_initialized()
         self._active_proc = proc
         try:
-            for entry in user_like_entries[:-1]:
+            for rel_idx, entry in new_entries_idx[:-1]:
                 await self._send_entry(proc, entry)
+                # Advance per-entry BEFORE the drain: once a line is on
+                # claude's stdin, claude will consume it + persist it to
+                # the session JSONL even if the resulting model_call
+                # aborts. If the drain fails, the next ``--resume`` MUST
+                # NOT re-write this entry (that produced the "Great
+                # smoke 3×" duplication observed in SWE's session log
+                # on 2026-06-03 around 14:30, when each retry re-wrote
+                # the earliest pending entry AND failed to reach the
+                # later entries that contained TL's STOP directives).
+                self._last_sent_index = base + rel_idx + 1
                 _ = await self._drain_until_result(
                     proc, on_text=None, on_thinking=None,
                     update_input_tokens=False,
                 )
-            await self._send_entry(proc, user_like_entries[-1])
+            last_rel_idx, last_entry = new_entries_idx[-1]
+            await self._send_entry(proc, last_entry)
+            self._last_sent_index = base + last_rel_idx + 1
             response = await self._drain_until_result(
                 proc, on_text, on_thinking,
             )
         except SubprocessTransportError:
-            # ``claude`` died mid-turn. Subsequent turns ``--resume`` the
-            # session that's on disk; whatever it managed to write is
-            # preserved. Don't reset ``_last_sent_index`` -- we still
-            # delivered everything up to ``user_like_entries[-1]`` to
-            # ``claude``'s session BEFORE it died (the user-line write
-            # to stdin happens before the model_call).
+            # ``claude`` died mid-turn. ``_last_sent_index`` already
+            # reflects every entry we wrote to stdin; the next
+            # ``--resume`` will skip them and pick up from the first
+            # entry we hadn't reached yet. The session JSONL on disk
+            # was updated by claude as it processed each line, so the
+            # next turn's view is consistent.
             await proc.close()
             self._active_proc = None
             raise
         else:
+            # All entries delivered + final drain returned cleanly.
+            # Advance past any trailing AssistantMessage / ToolResult
+            # entries (sagent's own bookkeeping; we never write them).
             self._last_sent_index = len(request.messages)
             # First successful turn established the session on disk;
             # all future spawns use ``--resume``.

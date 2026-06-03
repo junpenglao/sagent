@@ -331,6 +331,43 @@ def test_serialize_for_stdin_rejects_tool_result() -> None:
         )
 
 
+def test_anthropic_subprocess_env_overrides_home_when_tmpdir_set() -> None:
+    """Stateless mode (or session-persistent + per-account): tmpdir
+    becomes HOME so the renamed credentials file is found."""
+    from sagent.providers.anthropic_cli import _anthropic_subprocess_env
+
+    env = _anthropic_subprocess_env(Path("/tmp/probe"))
+    assert env["HOME"] == "/tmp/probe"
+    assert env["USERPROFILE"] == "/tmp/probe"
+    # Stateless default has CLAUDE_CODE_SKIP_PROMPT_HISTORY set.
+    assert env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] == "1"
+
+
+def test_anthropic_subprocess_env_skip_history_off_when_persistent() -> None:
+    """Session-persistent mode keeps the SKIP_PROMPT_HISTORY var unset
+    so claude actually writes its session JSONL."""
+    from sagent.providers.anthropic_cli import _anthropic_subprocess_env
+
+    env = _anthropic_subprocess_env(Path("/tmp/probe"), persist_session=True)
+    assert "CLAUDE_CODE_SKIP_PROMPT_HISTORY" not in env
+
+
+def test_anthropic_subprocess_env_inherits_real_home_when_tmpdir_none() -> None:
+    """Session-persistent + single-account: ``tmpdir=None`` means the
+    subprocess inherits the operator's real HOME so native tools (Bash,
+    gh, git) find ``~/.config/`` and ``~/.gitconfig``."""
+    import os as _os
+    from sagent.providers.anthropic_cli import _anthropic_subprocess_env
+
+    operator_home = _os.environ.get("HOME", "")
+    env = _anthropic_subprocess_env(None, persist_session=True)
+    # HOME comes through unchanged (inherited from os.environ).
+    assert env.get("HOME") == operator_home
+    # No USERPROFILE override either.
+    if "USERPROFILE" not in _os.environ:
+        assert "USERPROFILE" not in env
+
+
 def test_dispatch_stream_event_routes_text_and_thinking() -> None:
     """``content_block_delta`` events fan text/thinking into separate buckets."""
     text_parts: list[str] = []

@@ -1,4 +1,4 @@
-# blackjax-chat
+# blackjax-chat (v2 — session-resume CLI)
 
 A multi-agent chat channel for BlackJAX, built as a plugin on top of
 [sagent](https://github.com/rekursiv-ai/sagent). Five specialised
@@ -7,11 +7,103 @@ as long-running asyncio tasks in one Python process, talking to each
 other and a human operator through a typed inbox with mid-turn
 preemption, on-the-fly status, and a web UI.
 
+This is the **v2** layout. The frozen reference v1 lives at
+`../sagent_anthropic_cli_v1/` and is documented separately;
+the pivot v1 → v2 is summarised below. Install **v2** unless you
+specifically need to inspect v1's `restart_notice` observer.
+
 For the full history of how we got here (the failed `channel/` tmux
 runtime, the structural limits we hit, the external-MCP probe that
 unblocked us), see
 [`claude-config/project/worklog/threads/chat-to-sagent-migration.md`](../../../claude-config/project/worklog/threads/chat-to-sagent-migration.md).
 This README sticks to what's shipping and how to run it.
+
+---
+
+## Pivot from v1: session-resume instead of history re-feed
+
+Both `plugin/sagent_anthropic_cli_v1/` (frozen) and this directory
+(v2, the recommended install) implement the same chat channel, but
+v2 took a structural pivot mid-day 2026-06-02 → 06-03 morning. The
+short version:
+
+- **v1**'s CLI provider re-fed the full `agent.history` via stdin
+  on every respawn EXCEPT `AssistantMessage` entries, which it
+  stripped at `providers/anthropic_cli.py:537`. That meant the
+  respawned subprocess saw peer replies but no record of its own
+  prior delegations — which on `aborted_streaming` recovery made
+  opus re-issue work it had already done. The v1 plugin worked
+  around this with an in-tree `restart_notice` observer that
+  recovered each prior `sagent_send` from a per-agent
+  `outbound_log` and `runtime.append_splice`-ed synthetic
+  reconstructions back into history.
+
+- **v2** drops the re-feed + observer entirely. Each agent gets a
+  stable `UUIDv5` session id; every `claude --print` subprocess
+  spawns with `--session-id <uuid>` (first turn) or
+  `--resume <uuid>` (subsequent turns). `claude` itself owns the
+  on-disk transcript — assistant turns, `tool_use` blocks,
+  `tool_result` blocks, all preserved — at
+  `~/.claude/projects/-<encoded-cwd>/<uuid>.jsonl`. Sagent stops
+  feeding history at all; only the new inbound is sent per turn.
+  The `restart_notice` observer is deleted because the problem
+  it papered over no longer exists.
+
+Why pivot at all? Two reasons:
+
+1. **The v1 observer was theatre on real-world history.** It
+   walked `runtime.tape` looking for outbound `sagent_send` tool
+   calls in `AssistantMessage.tool_calls`, but the CLI provider
+   always returns `tool_calls=()` (`anthropic_cli.py:924`) — the
+   MCP tool round-trip runs opaquely inside `claude --print`.
+   The observer's bug-shape unit tests passed because they seeded
+   synthetic `ToolCall` entries the provider never produces.
+   v1 caught this on 2026-06-02 evening; the next iteration of
+   the observer pulled outbounds from a separate `outbound_log`
+   populated by `/api/post` instead, but it was still a
+   reconstruction.
+
+2. **Session-resume sidesteps the rest of the problem too.**
+   On `aborted_streaming`, claude's session JSONL is already on
+   disk with everything the respawned subprocess needs.
+   `--resume <uuid>` picks up the conversation including
+   tool_use/tool_result round-trips and thinking blocks; sagent
+   doesn't have to reconstruct anything. Prompt cache hits stay
+   warm across turns (~40k cache reads observed on resumed
+   turns vs zero in v1's re-feed shape).
+
+The v2 changes live on the `feat/cli-session-resume` branch:
+
+- **Upstream sagent (`providers/anthropic_cli.py`):** opt-in
+  `session_id` parameter on `AnthropicCLI.model(...)`. When set,
+  argv swaps `--no-session-persistence` for `--session-id` /
+  `--resume`, HotSpare is bypassed (spawn-on-demand per turn —
+  pre-warming a spare with `--resume` branches the conversation
+  tree), and history re-feed is disabled.
+- **Plugin (`roles/common.py`):** every agent built with a
+  stable `UUIDv5(namespace, f"blackjax-chat:{role_name}")`
+  passed to `provider.model(session_id=…)`. Survives server
+  restarts because the namespace + role label are deterministic.
+- **Plugin runtime:** `runtime/restart_notice.py` deleted along
+  with its 11 unit tests, the `outbound_log` plumbing, and the
+  debug seed/inject endpoints that only existed for observer
+  validation.
+
+What still differs from v1 (other than the deletions):
+
+- v2 inherits the operator's real `HOME` in session-persistent
+  + single-account mode, so native tools (`Bash`-from-shell, `gh`,
+  `git`, ssh) find `~/.config/`, `~/.gitconfig`, etc. (v1 had a
+  hermetic per-spawn tmpdir but mounted those tools via sagent's
+  HTTP bridge — the handler ran in the sagent server process
+  with the operator's real HOME, so it was a non-issue. v2's
+  tools run inside `claude --print`, so the env has to be
+  right at the subprocess.)
+- `--tools ""` is omitted from the argv in session-persistent
+  mode (bisect 2026-06-03 found that flag becomes "allow NO
+  tools, INCLUDING MCP ones" once `--session-id` is set, which
+  silently broke structured tool dispatch). Stateless mode keeps
+  the flag — no observed regression.
 
 ---
 
@@ -45,9 +137,15 @@ This README sticks to what's shipping and how to run it.
 │                                                                          │
 │  Runtime observers per agent:                                            │
 │   • trace_writer    → sessions/<role>.trace.jsonl                        │
-│   • restart_notice  → splices outbound reconstructions on respawn        │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
+
+Beyond `$SAGENT_DATA_DIR`, each agent's claude session JSONL (the
+authoritative transcript under v2) lands at the operator's real
+`~/.claude/projects/-<encoded-cwd>/<uuid>.jsonl` and survives
+`serve.py` restarts — the next server boot `--resume`s the prior
+conversation per agent. To start one agent fresh, delete its
+session JSONL.
 
 Three layers because each MCP server is its own Python process (spawned
 by `claude --print` via `--mcp-config`) and can't reach the live
@@ -116,9 +214,17 @@ the compressed version:
 Beyond those three: the CLI provider strips `AssistantMessage` entries
 before re-feeding history to a respawned subprocess
 (`providers/anthropic_cli.py:537`) — so on `aborted_streaming`
-recovery, the model has no record of its own prior delegations. The
-plugin works around this with the splice-based `restart_notice`
-observer (override #3 below).
+recovery, the model has no record of its own prior delegations.
+
+In **v1** this was worked around in-plugin via the splice-based
+`restart_notice` observer. In **v2** it's structurally bypassed:
+each agent runs with `--session-id` / `--resume`, claude itself owns
+the on-disk transcript including assistant turns + tool_use blocks,
+sagent doesn't re-feed history at all, and respawn `--resume`s the
+session that was already on disk. The stripping line still exists
+in the provider for stateless-mode callers; session-persistent mode
+just never reaches it. The override #3 below is now "session id
+wiring" rather than the observer.
 
 ---
 
@@ -148,30 +254,53 @@ tool dispatches, so `_stop_all_tools` has nothing to act on. Without
 this, mid-turn corrections wait for the current turn to drain.
 Implementation lives on `feat/cli-preempt-via-sigint` in this fork.
 
-### 3. `restart_notice` observer  (plugin-side, not a sagent flag)
+### 3. `session_id=<uuid>` on `provider.model(...)`  (upstream, opt-in)
 
-`providers/anthropic_cli.py:537` strips ALL `AssistantMessage` entries
-before re-feeding history to a respawned subprocess. The new subprocess
-sees peer replies but NOT its own prior delegations — so on
-`aborted_streaming`/`ede_diagnostic` recovery, opus rationally re-issues
-delegations it already made.
+Each agent gets a stable `UUIDv5(namespace,
+f"blackjax-chat:{role_name}")` passed into the provider at
+construction time. The CLI provider then:
 
-The observer (`runtime/restart_notice.py`) watches for
-`ModelResponseError`. When fired, it walks `runtime.tape`, recovers each
-prior `sagent_send`'s `to`/`content`, and `runtime.append_splice`-es a
-synthetic UserMessage immediately after each matching peer reply:
+- Spawns `claude --print --session-id <uuid>` on the first turn
+  and `--resume <uuid>` on every turn after that, in place of the
+  upstream default `--no-session-persistence`.
+- Sends only the newest user-like inbound to stdin per turn —
+  claude has the rest in its session JSONL on disk.
+- Bypasses HotSpare (each `stream()` call spawns its own
+  subprocess; pre-warming a spare with `--resume <same-uuid>`
+  branches the conversation tree).
+- Inherits the operator's real HOME so native tools (Bash, gh,
+  git, ssh) find `~/.config/`, `~/.gitconfig`, etc. (Stateless
+  mode kept a hermetic per-spawn tmpdir for credential isolation
+  — fine because its tools ran via the bridge in the sagent
+  server process, with the operator's real HOME. Session-
+  persistent mode runs tools inside `claude --print`, so the
+  env has to be right at the subprocess.)
+- Omits `--tools ""` from the argv: bisect probe 2026-06-03
+  found that flag becomes "allow NO tools, INCLUDING MCP ones"
+  once `--session-id` is set, silently breaking structured
+  dispatch. Stateless mode keeps the flag.
 
-```
-[from sagent runtime] You previously sent to @swe: "<original content>"
-```
+With this in place:
 
-The respawned CLI subprocess then sees clean outbound→inbound pairings in
-its stdin feed and naturally consolidates instead of re-delegating. The
-observer also pushes one orienting `[handoff from previous session]`
-notice onto the inbox summarising the reconstruction.
+- `aborted_streaming` recovery is structurally clean: the
+  respawned `claude --print` `--resume`s the on-disk session,
+  which already contains every assistant turn + tool_use block
+  the prior subprocess emitted. No reconstruction needed; no
+  observer needed.
+- Prompt-cache hits stay warm across turns (~40k cache reads on
+  resumed turns vs ~0 in v1's re-feed shape).
+- `serve.py` restarts pick up the prior conversation per agent
+  — the session JSONLs survive at
+  `~/.claude/projects/-<encoded-cwd>/<uuid>.jsonl`.
+- The plugin's `runtime/restart_notice.py` is deleted along
+  with its 11 unit tests, the per-agent `outbound_log`, and the
+  debug seed/inject endpoints.
 
-Unit tests in `tests/restart_notice_test.py` (11 passing); live
-behavioural validation pending the next organic API hiccup.
+For per-account use (`provider.account is not None`), the
+provider still mints a per-construction-time hermetic tmpdir
+with the renamed credentials file — claude's creds path is
+hardcoded to `$HOME/.claude/.credentials.json` and there's no
+env redirect.
 
 ---
 
@@ -223,35 +352,44 @@ instead of `claude --print` subprocesses), speculative and not built.
 Marker key: ✅ works / materially better, ⚠️ works with caveats,
 ❌ broken or materially worse, 🔮 speculation.
 
-| Dimension | `channel/` (tmux) | sagent+CLI (today) | sagent+API (speculative) |
+The middle column is now **v2** (sagent + CLI in `--session-id` /
+`--resume` mode). For the v1 numbers (stripping work-arounds via
+`restart_notice`, no cache hits, etc.) see
+`plugin/sagent_anthropic_cli_v1/README.md`.
+
+| Dimension | `channel/` (tmux) | sagent+CLI v2 (today) | sagent+API (speculative) |
 |---|---|---|---|
 | **Process model** | ❌ One Python worker per agent, per tmux pane, per systemd cgroup. | ✅ Single process, asyncio task per agent. | 🔮 Same, but no CLI subprocesses at all. |
-| **Cross-agent latency** | ❌ 5–15 s (poll cycle + cold CLI start). | ✅ Sub-second (in-process inbox + warm subprocess). | 🔮 Sub-second, no subprocess to wait on. |
+| **Cross-agent latency** | ❌ 5–15 s (poll cycle + cold CLI start). | ✅ Sub-second (in-process inbox + per-turn fresh subprocess). | 🔮 Sub-second, no subprocess to wait on. |
 | **Per-turn token overhead** | ❌ 300–500 tok reminder appended per directive (CLI session_id resets). | ✅ ~Zero marginal (system prompt + tool description cached). | 🔮 ~Zero, with full operator control over `cache_control` markers. |
 | **Mid-turn cancel** | ❌ `kill -9`, no clean shutdown. | ✅ SIGINT to subprocess (override #2). | 🔮 Native — close the SSE stream. |
-| **History feed on respawn** | ⚠️ New CLI session; full history re-fed via stdin. | ⚠️ Sagent re-feeds, BUT `anthropic_cli.py:537` strips ALL `AssistantMessage` entries before write. | ✅ History is just `messages=`; assistant turns + `tool_use` + `tool_result` blocks all go in verbatim. |
-| **Outbound visibility on respawn** | ✅ Survives the stdin re-feed. | ❌→✅ Stripped by default. **Fixed in-plugin** by `restart_notice` splice-based reconstruction (override #3). | ✅ Free — `tool_use` blocks in `messages=` verbatim. |
-| **`aborted_streaming` recovery** | ❌ CLI dies; manual restart. | ⚠️ Auto-respawn + observer notice. Cost: full prompt-cache miss (sagent's re-feed fingerprint ≠ claude's session-resume bytes). | 🔮 Honour the API's own `retry_delay_ms` (we get it today but ignore it); reissue with the same `messages=`. Cache stays warm. **Likely the biggest token-cost win** under organic-error pressure. |
-| **Tool results in history** | ⚠️ Recreated from scratch each turn. | ⚠️ Internal to CLI; `ToolResult` in `agent.history` raises on the stdin path (`anthropic_cli.py:813-818`). Can't replay prior turns. | ✅ First-class user-message block; replayable. |
-| **Prompt-cache hit rate** | ❌ Low (CLI session resets per turn). | ⚠️ Medium; respawn eats a full cache miss. | 🔮 High and operator-controllable. |
-| **Observability** | ⚠️ Manual log scraping. | ✅ `/api/agents`, `/api/trace/<role>`, `/debug` console, web UI. | 🔮 Inherits the plugin's `/api/*` and traces — they observe runtime events, not transport. |
-| **Implementation complexity** | ❌ Per-pane workers, mention router, polling, cgroup wiring. | ⚠️ Single binary, but three overrides + HTTP MCP bridge + observer needed. | 🔮 Direct SDK calls; observer + most overrides become unnecessary. |
-| **Measured per-turn cost** | Baseline. | ✅ ~30% lower than `channel/`. | 🔮 Likely another 20–40% lower under error pressure; on par on the happy path. |
+| **History feed on respawn** | ⚠️ New CLI session; full history re-fed via stdin. | ✅ No re-feed at all. `claude` owns the JSONL on disk; the respawn `--resume`s. Assistant turns + `tool_use` + `tool_result` blocks all preserved. | ✅ History is just `messages=`; assistant turns + `tool_use` + `tool_result` blocks all go in verbatim. |
+| **Outbound visibility on respawn** | ✅ Survives the stdin re-feed. | ✅ `tool_use` blocks live in claude's own session JSONL; nothing to reconstruct on respawn. | ✅ Free — `tool_use` blocks in `messages=` verbatim. |
+| **`aborted_streaming` recovery** | ❌ CLI dies; manual restart. | ✅ Auto-respawn + `--resume`. Prompt cache stays warm because the resumed session byte-fingerprint matches claude's own resume bytes. | 🔮 Honour the API's own `retry_delay_ms` (we get it today but ignore it); reissue with the same `messages=`. Same outcome via a different path. |
+| **Tool results in history** | ⚠️ Recreated from scratch each turn. | ✅ Preserved across resume; the respawned subprocess can introspect prior tool calls + results. | ✅ First-class user-message block; replayable. |
+| **Prompt-cache hit rate** | ❌ Low (CLI session resets per turn). | ✅ High — ~40k cache reads on resumed turns observed in 2026-06-03 testing. | 🔮 High and operator-controllable. |
+| **Observability** | ⚠️ Manual log scraping. | ✅ `/api/agents`, `/api/trace/<role>`, `/debug` console, web UI. `ToolLabel` events surfaced from the stream-json content blocks with name + args summary. | 🔮 Inherits the plugin's `/api/*` and traces — they observe runtime events, not transport. |
+| **Implementation complexity** | ❌ Per-pane workers, mention router, polling, cgroup wiring. | ⚠️ Single binary, two overrides + opt-in `session_id` provider flag + HTTP MCP bridge. (v1's `restart_notice` observer deleted.) | 🔮 Direct SDK calls; all overrides become unnecessary. |
+| **Survives `serve.py` restart** | ❌ Each restart loses conversation. | ✅ Claude session JSONLs at `~/.claude/projects/-<encoded-cwd>/<uuid>.jsonl` survive; next server boot `--resume`s per agent. | 🔮 Same — `messages=` can be loaded from anywhere. |
+| **Native tool config (`gh`, `git`, ssh)** | ✅ Per-pane shell inherits operator env. | ✅ Session-persistent + single-account inherits real HOME so `~/.config/gh/`, `~/.gitconfig`, ssh keys all visible to claude's native tools. | 🔮 N/A — no subprocess tools. |
+| **Measured per-turn cost** | Baseline. | ✅ ~30% lower than `channel/`, with further savings under error pressure from preserved cache. | 🔮 On par on the happy path. |
 
-**Summary.** Migrating `channel/` → sagent+CLI was a big win on
-latency, token cost, and observability. The price was inheriting two
-CLI-shape problems (history stripping; opaque retry on `aborted_streaming`)
-that we now mitigate in-plugin via overrides + the splice-based
-`restart_notice` observer. The sagent+API jump is plausible if error
-pressure stays elevated — it would delete the observer complexity and
-reclaim the prompt-cache on recovery — but needs a non-CLI sagent
-provider.
+**Summary.** v2 was a structural pivot from v1's "patch around CLI
+stripping" approach. The price of the pivot: spawn-on-demand
+instead of warm HotSpare reuse (3–5 s extra per turn) and the fact
+that we now depend on a previously-undocumented CLI mode
+(`--session-id` + `--resume`). The wins: no observer complexity,
+prompt cache stays warm across respawns, claude session JSONLs
+survive server restarts, native tools find operator config. The
+sagent+API column would be a further simplification but is not
+built — and the gap to v2 is much smaller than the gap from v1
+was.
 
 ---
 
-## Validation status (2026-06-02 evening)
+## Validation status (2026-06-03 morning, post-v2 pivot)
 
-**Closed** (live-validated today):
+**Closed (v1 carried over to v2)**:
 
 - ✅ Mention-router duplicate-emit cannot reproduce (router is gone).
 - ✅ `hello, ready` warmup-template regression cannot reproduce
@@ -259,25 +397,40 @@ provider.
 - ✅ `sagent_defer` round-trip works (`tl` scheduled +30 s, SWE
   later self-deferred +300 s and +180 s for CI polling — both fired
   on time, no `bash sleep` hangs).
-- ✅ Structured channel works on opus/sonnet/haiku via external MCP
-  (every live test today produced `tool_use` for
-  `mcp__sagent_chat__sagent_send`).
-- ✅ Mid-turn preempt works (SIGINT path fired during organic
-  `ModelResponseError` events).
-- ✅ Per-turn cost ~50% lower than the pre-migration baseline; ~30%
-  lower than `channel/` on equivalent workloads.
+- ✅ Structured channel works on opus/sonnet/haiku via external MCP.
+- ✅ Mid-turn preempt works (SIGINT path fires on organic
+  `ModelResponseError`).
 - ✅ Sub-second cross-agent latency.
+
+**Closed by v2 pivot**:
+
+- ✅ AssistantMessage stripping → re-delegation on respawn.
+  Structurally impossible now — claude's session JSONL contains
+  the full prior assistant turn including tool_use blocks, and
+  `--resume` picks it up byte-for-byte from disk.
+- ✅ Native tools find operator config. v1 mounted Bash/Read/Glob
+  via the bridge so the issue never surfaced; v2 runs them inside
+  `claude --print`, so HOME passthrough was needed. `gh auth
+  status` from inside a v2 agent now shows the operator's
+  authenticated session.
+- ✅ Session survival across `serve.py` restart. Each agent's
+  JSONL persists at `~/.claude/projects/-home-jp-blackjax-devs/`;
+  next boot `--resume`s it.
+- ✅ Prompt cache hits across turns. ~40k cache reads observed
+  on a typical resumed turn vs ~0 in v1's re-feed shape.
+- ✅ Structured tool dispatch under `--session-id` (after the
+  `--tools ""` removal — bisect 2026-06-03 found that flag
+  silently disables MCP tool dispatch once `--session-id` is
+  set).
 
 **Open**:
 
 - [ ] `bin/merge_jsonl.py` round-trip across both streams (~30 min check).
 - [ ] End-to-end PR drive (implementation phase, not just plan mode).
-- [ ] Live validation of the `restart_notice` splice path under organic
-  `aborted_streaming` (unit tests + deterministic seed test pass; needs
-  an organic firing).
 - [ ] Phase 6 cutover decision file at
   `claude-config/project/worklog/decisions/2026-06-02-blackjax-chat-cutover.md`.
-- [ ] `/debug` page walkthrough (main `/` view confirmed).
+- [ ] Long-running soak test (multi-hour session under organic
+  `aborted_streaming` flare).
 
 ---
 
@@ -297,92 +450,74 @@ missing, check the most recent `ModelResponseComplete` in
 No structural fix yet. Stronger `PEER_MESSAGING` wording has been
 tried twice with limited effect.
 
-### B. `aborted_streaming` / `ede_diagnostic` errors (the biggest live problem)
+### B. `aborted_streaming` / `ede_diagnostic` errors (v1's biggest pain, structurally resolved in v2)
 
-**This is the dominant operational pain point as of 2026-06-02 —
-worth its own section.** Across the day the Anthropic streaming API
-fired `SubprocessTransportError: aborted_streaming` and
-`ede_diagnostic` errors on opus and sonnet roughly once every 3–10
-minutes during sustained multi-agent traffic. Real examples observed
-today:
+In v1 this was the dominant operational pain point. Across
+2026-06-02 the Anthropic streaming API fired
+`SubprocessTransportError: aborted_streaming` and `ede_diagnostic`
+errors on opus and sonnet roughly once every 3–10 minutes during
+sustained traffic. v1's failure mode chain:
 
-- 12:53–12:58: three back-to-back errors on TL (5 min window).
-- 17:36–17:48: three errors on TL + one on statistician (12 min).
-- 18:29–18:30: two errors on TL inside 60 s — the second fired ~6 s
-  into the recovery turn, before the first had finished consolidating.
-- 19:02+: still flaring intermittently on the running server.
+- The agent's CLI subprocess dies mid-stream.
+- Sagent publishes `ModelResponseError` + respawns.
+- The respawn re-feeds history but **strips assistant turns**
+  (`anthropic_cli.py:537`), so the new subprocess has no record
+  of its own prior delegations and tends to re-issue them.
+- Each respawn ate a full prompt-cache miss (sagent's re-fed
+  bytes ≠ claude's session-resume bytes; the cache key didn't
+  match).
 
-**What it looks like operationally:**
+v2 changes the structure:
 
-- The agent's CLI subprocess dies mid-stream with
-  `SubprocessTransportError("AnthropicCLI: result is_error: …
-  terminal_reason: aborted_streaming … errors: ['[ede_diagnostic]
-  result_type=user last_content_type=n/a stop_reason=tool_use'])`.
-- Sagent's `_AnthropicCLIModel` publishes `ModelResponseError` and
-  respawns a fresh `claude --print` subprocess automatically.
-- The respawn re-feeds history but strips `AssistantMessage` entries
-  (`anthropic_cli.py:537`). Without the `restart_notice` observer the
-  fresh subprocess has no record of its own prior delegations and
-  often re-issues them — the original symptom we built the observer
-  for.
-- **Each respawn eats a full prompt-cache miss.** Sagent's re-fed
-  byte sequence ≠ what claude's own session-resume would emit, so
-  Anthropic's cache key doesn't match. On opus this is the largest
-  single token cost per recovery.
-- The error response from the API includes a `retry_delay_ms`
-  schedule (we've seen `506 ms / 1247 ms / 2107 ms …` in headers).
-  **Sagent does not honour it.** `agent/retry.py:345`'s whitelist
-  bails on `aborted_streaming` / `ede_diagnostic` / `529` and goes
-  straight to subprocess respawn instead of retrying the same call.
+- Sagent doesn't re-feed history. Each turn is a fresh
+  `claude --print --resume <uuid>` subprocess.
+- Claude's session JSONL on disk already contains every prior
+  assistant turn including tool_use + tool_result blocks. The
+  respawned subprocess `--resume`s that, byte-for-byte
+  identical to what claude itself would write — so Anthropic's
+  prompt-cache key matches and the resumed turn is a cache hit.
+- The re-delegation symptom can't happen because the model
+  sees its own prior outputs in the resumed session.
 
-**What's mitigated today:**
+**What remains of the v1 pain in v2**:
 
-- ✅ Auto-respawn — sagent's `HotSpare` brings the agent back without
-  operator intervention.
-- ✅ Model-side anchoring on respawn — the `restart_notice` observer
-  (override #3 above) walks the tape, recovers each prior
-  `sagent_send`'s arguments, and splices a `[from sagent runtime]
-  You previously sent to @<peer>: "<content>"` after each matching
-  peer reply. The respawned subprocess sees the conversation as
-  paired outbound→inbound and naturally consolidates instead of
-  re-delegating.
+- Each `aborted_streaming` event still adds latency — sagent
+  publishes `ModelResponseError` to the runtime, and the next
+  turn spawns a fresh process. But the model continuation is
+  correct without operator intervention or observer scaffolding.
+- The `retry_delay_ms` schedule the API itself emits is still
+  ignored. Honouring it (upstream `sagent/agent/retry.py:345`
+  whitelist expansion) would mean the SAME subprocess just
+  retries instead of dying — even cheaper than `--resume`. Not
+  yet staged.
 
-**What's NOT mitigated yet (the biggest open lever):**
+**Operator playbook under v2**:
 
-- ⏳ **Honour `retry_delay_ms` in `send_with_retry`** instead of
-  respawning. This is the upstream fix — ~10 lines in
-  `sagent/agent/retry.py:345` to expand the retryable-error whitelist
-  and use the schedule the API itself emits. Would eliminate most
-  respawns at the source (the cause, not the symptom), preserve the
-  prompt-cache, and make the `restart_notice` observer's job rare
-  rather than per-incident. Not yet staged.
-- ⏳ **Per-role circuit breaker** — when N `ModelResponseError`
-  events fire on one role within M minutes, auto-restart the role
-  and surface to the operator. Higher complexity. Only worth doing
-  if the upstream retry fix doesn't sufficiently quiet the errors.
-
-**Operator playbook** while we're stuck with respawns:
-
-- Watch the server log for
-  `RestartNoticeObserver: @<role> ModelResponseError`. Each line is
-  one recovery. Repeated firings on the same role within ~1 min
-  often cascade — consider `/api/restart` to wipe + recover cleanly
-  rather than letting the observer paper over multiple stacked
-  errors.
-- The web UI's per-agent diagnosis (`hung` with high `age_sec`) often
-  reflects a respawn in progress rather than a stuck agent.
-- Token cost spikes during error storms are real — opus respawns
-  burned ~$0.20–$0.40 per recovery in today's runs. If error
-  pressure stays elevated, prioritising the `retry_delay_ms`
-  upstream fix is the biggest single token-cost lever available.
+- `aborted_streaming` events that happen between turns are
+  invisible to the operator now — the next turn just
+  `--resume`s cleanly. Server log shows
+  `ModelResponseError` followed by a fresh `ModelCallStarted`
+  with no observer activity.
+- `aborted_streaming` events that interrupt an in-flight turn
+  surface as `agent.status == "hung"` briefly while the
+  subprocess respawns. The next turn picks up via `--resume`.
+- If many errors stack (rare in v2 but still possible),
+  `/api/restart` wipes sagent's in-memory state AND
+  ``agent.clear()`` re-uses the same session_id — so the
+  agent's claude session JSONL is **NOT** deleted unless you
+  manually `rm` it. Useful when you want to flush sagent's
+  inbox without losing claude's conversation history; risky
+  when sagent and claude have drifted out of sync (rare).
 
 ---
 
 ## Status
 
-Plugin is functional for daily operator use. `channel/` can be shut
-down in parallel whenever ready. The Phase 6 decision file is the
-remaining paperwork. **The `aborted_streaming` error rate is the
-dominant residual risk** — the in-plugin mitigation (`restart_notice`
-splice) is in place, but the upstream `send_with_retry` patch is
-the actual fix if the API pressure stays elevated.
+Plugin is functional for daily operator use. The v2 pivot
+removed the dominant residual risk that hung over v1
+(`aborted_streaming` re-delegation cascades) at the cost of one
+new dependency (the `--session-id` / `--resume` mode of
+`claude --print`, which is documented but rarely used in
+production tooling). `channel/` can be shut down in parallel
+whenever ready. The Phase 6 decision file is the remaining
+paperwork.

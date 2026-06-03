@@ -312,20 +312,47 @@ class _AnthropicCLIModel:
             self._persistent_tmpdir: Path | None = None
         else:
             self._hot_spare = None
-            # Session-persistence mode: ``claude`` writes its session
-            # transcript to ``<HOME>/.claude/projects/-<encoded-cwd>/
-            # <uuid>.jsonl``. The stateless path's per-spawn tmpdir
-            # would orphan that file every turn -- ``--resume`` on the
-            # next spawn would point at a tmpdir with no projects/
-            # dir. So we mint ONE tmpdir at construction time, populate
-            # credentials once, and reuse it as ``HOME`` for every
-            # ``claude`` subprocess this model spawns.
-            self._persistent_tmpdir = Path(
-                tempfile.mkdtemp(prefix="sagent-anthropic-cli-resume-"),
-            )
-            _populate_anthropic_tmpdir(
-                self._persistent_tmpdir, self._provider.account,
-            )
+            # Session-persistence mode tradeoff on the ``HOME`` env var:
+            #
+            # If we override HOME to a hermetic tmpdir (as stateless
+            # mode does for credential isolation), then claude's
+            # NATIVE tools -- ``Bash``, ``Read``, ``Write``, etc. --
+            # run with that hermetic HOME inside the ``claude --print``
+            # subprocess. They lose visibility into the operator's
+            # ``~/.config/gh/hosts.yml``, ``~/.gitconfig``, ssh keys,
+            # etc. This shows up as ``gh auth status`` reporting "not
+            # authenticated" even though the operator IS authenticated
+            # on the host. (In stateless mode the same tools were
+            # mounted via sagent's HTTP bridge, so their handler ran
+            # IN THE SAGENT SERVER PROCESS with the operator's real
+            # HOME -- mooting the issue.)
+            #
+            # In session-persistence mode + single-account
+            # (``provider.account is None``), we drop the HOME
+            # override entirely. ``claude`` reads its credentials
+            # from the operator's real ``~/.claude/.credentials.json``,
+            # native tools find ``~/.config/gh/``, and session
+            # JSONLs land at the operator's real
+            # ``~/.claude/projects/-<encoded-cwd>/<uuid>.jsonl``,
+            # which survives ``serve.py`` restarts -- so re-running
+            # the server now ``--resume``s the prior conversation
+            # transcripts cleanly.
+            #
+            # For per-account use (``provider.account is not None``)
+            # we still mint a tmpdir + populate the renamed
+            # credentials file, because ``claude``'s creds path is
+            # hardcoded to ``$HOME/.claude/.credentials.json`` --
+            # there's no env var to redirect it. That case keeps the
+            # stateless-mode HOME-override behaviour.
+            if self._provider.account is None:
+                self._persistent_tmpdir = None
+            else:
+                self._persistent_tmpdir = Path(
+                    tempfile.mkdtemp(prefix="sagent-anthropic-cli-resume-"),
+                )
+                _populate_anthropic_tmpdir(
+                    self._persistent_tmpdir, self._provider.account,
+                )
         self._active_proc: Subproc | None = None
         # Set by ``stream`` before ``_spawn_initialized`` reads them.
         self._pending_system: str = ""
@@ -809,16 +836,29 @@ class _AnthropicCLIModel:
         if self._tools_bridge is None:
             self._tools_bridge = ToolsBridge(tools=[])
             await self._tools_bridge.start()
+        spawn_owned_tmpdir: Path | None
+        tmpdir: Path | None
         if self._persistent_tmpdir is not None:
-            # Session-persistence mode: reuse the construction-time
-            # tmpdir so claude's session file persists across spawns.
-            # NB: the Subproc wrapper takes ownership of ``tmpdir`` for
-            # cleanup. We pass ``None`` (no per-spawn cleanup) and the
-            # model itself disposes of ``_persistent_tmpdir`` in
-            # ``close()``.
+            # Session-persistence + per-account: reuse the
+            # construction-time tmpdir so the renamed credentials
+            # file is found by claude (its creds path is hardcoded
+            # to $HOME/.claude/.credentials.json).
             tmpdir = self._persistent_tmpdir
-            spawn_owned_tmpdir: Path | None = None
+            spawn_owned_tmpdir = None
+        elif self._session_id is not None:
+            # Session-persistence + single account: NO HOME override.
+            # The subprocess inherits the operator's real HOME so
+            # native tools (``Bash``-from-shell, ``gh``, ``git``,
+            # ssh, ...) find ``~/.config/``, ``~/.gitconfig``, etc.,
+            # AND ``claude`` reads + writes session JSONLs at the
+            # operator's real ``~/.claude/projects/`` (which
+            # survives ``serve.py`` restarts -- a free upgrade).
+            tmpdir = None
+            spawn_owned_tmpdir = None
         else:
+            # Stateless mode: hermetic per-spawn tmpdir for
+            # credential isolation. The Subproc wrapper deletes it
+            # on close.
             tmpdir = Path(tempfile.mkdtemp(prefix="sagent-anthropic-cli-"))
             _populate_anthropic_tmpdir(tmpdir, self._provider.account)
             spawn_owned_tmpdir = tmpdir
@@ -944,7 +984,7 @@ def _populate_anthropic_tmpdir(tmpdir: Path, account: str | None) -> None:
 
 
 def _anthropic_subprocess_env(
-    tmpdir: Path, *, persist_session: bool = False
+    tmpdir: Path | None, *, persist_session: bool = False
 ) -> dict[str, str]:
     """Build the env for the ``claude`` subprocess (telemetry off, hermetic HOME).
 
@@ -953,12 +993,19 @@ def _anthropic_subprocess_env(
     to skip writing its session JSONL even when ``--session-id`` /
     ``--resume`` are passed, which makes session-persistence mode silently
     no-op and the next ``--resume`` fails with "No conversation found".
+
+    When ``tmpdir is None`` we don't override ``HOME`` -- the subprocess
+    inherits the operator's real HOME so claude finds its real
+    credentials + project session JSONLs AND its native tools (Bash,
+    gh, git, ...) find ``~/.config/`` and ``~/.gitconfig`` naturally.
+    Used by the session-persistent + single-account path.
     """
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    if tmpdir is not None:
+        env["HOME"] = str(tmpdir)
+        env["USERPROFILE"] = str(tmpdir)
     env.update(
         {
-            "HOME": str(tmpdir),
-            "USERPROFILE": str(tmpdir),
             "DISABLE_AUTO_COMPACT": "1",
             "DISABLE_TELEMETRY": "1",
             "DISABLE_ERROR_REPORTING": "1",

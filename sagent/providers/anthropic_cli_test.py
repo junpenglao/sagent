@@ -352,6 +352,115 @@ def test_anthropic_subprocess_env_skip_history_off_when_persistent() -> None:
     assert "CLAUDE_CODE_SKIP_PROMPT_HISTORY" not in env
 
 
+@pytest.mark.asyncio
+async def test_session_persistent_stream_returns_empty_when_history_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After ``agent.clear()``, sagent's runtime calls ``stream()`` with
+    an empty ``request.messages`` until new input arrives. The
+    session-persistent path detects this (``_last_sent_index > len``),
+    resets its counters, deletes the stale on-disk session JSONL so
+    the next ``--session-id`` call works, and returns a no-op
+    ``ModelResponse`` rather than crashing the runtime turn.
+
+    Regression for 2026-06-03 07:20 ``RuntimeError: stream() called
+    with no new user-like entries to send`` triggered by /api/restart
+    on TL.
+    """
+    _write_creds(tmp_path)
+    monkeypatch.setattr(
+        "sagent.providers.anthropic_cli._CREDS_PATH",
+        tmp_path / ".credentials.json",
+    )
+
+    def _which_claude(name: str) -> str | None:
+        del name
+        return "/usr/bin/claude"
+
+    monkeypatch.setattr(
+        "sagent.providers.anthropic_cli.shutil.which", _which_claude,
+    )
+    # Point HOME at tmp_path so the JSONL-cleanup glob is sandboxed.
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    provider = AnthropicCLI.from_credentials()
+    sid = "deadbeef-1234-5678-9abc-deadbeef1234"
+    model = provider.model("claude-haiku-4-5", session_id=sid)
+
+    # Stage 1: pretend two turns of conversation already happened
+    # (``_last_sent_index == 2``, on-disk session JSONL present).
+    model._last_sent_index = 2
+    model._session_initialized = True
+    proj_dir = tmp_path / ".claude" / "projects" / "-some-cwd"
+    proj_dir.mkdir(parents=True)
+    jsonl = proj_dir / f"{sid}.jsonl"
+    jsonl.write_text("{}\n", encoding="utf-8")
+    assert jsonl.exists()
+
+    # Stage 2: simulate post-``agent.clear()`` call: history is empty
+    # but the provider's counters still think 2 messages were sent.
+    request = ModelRequest(
+        system="terse", messages=(), tools=(),
+    )
+    response = await model.stream(
+        request, on_text=None, on_thinking=None,
+    )
+
+    # The response is a no-op (empty assistant text, no tools, zero
+    # cost) so the runtime gets a clean "model said nothing" turn.
+    assert response.message.text == ""
+    assert response.message.tool_calls == ()
+    assert response.tokens.input_tokens == 0
+    assert response.tokens.output_tokens == 0
+
+    # Provider state was reset: next real call will use ``--session-id``
+    # (not ``--resume``).
+    assert model._last_sent_index == 0
+    assert model._session_initialized is False
+
+    # The stale on-disk JSONL was removed so the next ``--session-id``
+    # spawn doesn't error with "Session ID is already in use".
+    assert not jsonl.exists()
+
+
+def test_model_session_initialized_probes_disk_at_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``serve.py`` restart should pick up prior conversations
+    transparently: at construction time the provider probes
+    ``$HOME/.claude/projects/*/<uuid>.jsonl`` and sets
+    ``_session_initialized = True`` if any match -- so the first
+    spawn uses ``--resume`` (not ``--session-id``, which would
+    error with "Session ID is already in use").
+    """
+    sid = "deadbeef-1234-5678-9abc-deadbeef1234"
+    other = "1c0705bd-ecf6-55a2-91cc-9d519e9ca6f6"
+
+    # Stage 1: empty $HOME -> session_initialized is False.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    provider = AnthropicCLI()
+    model = provider.model("claude-haiku-4-5", session_id=sid)
+    assert model._session_initialized is False
+
+    # Stage 2: drop a session JSONL for OUR sid under an arbitrary
+    # cwd-encoded subdir -> session_initialized flips to True.
+    proj = tmp_path / ".claude" / "projects" / "-some-cwd"
+    proj.mkdir(parents=True)
+    (proj / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+    model = provider.model("claude-haiku-4-5", session_id=sid)
+    assert model._session_initialized is True
+
+    # Stage 3: jsonl exists for a DIFFERENT uuid but not ours -> still False.
+    (proj / f"{other}.jsonl").write_text("{}\n", encoding="utf-8")
+    (proj / f"{sid}.jsonl").unlink()
+    model = provider.model("claude-haiku-4-5", session_id=sid)
+    assert model._session_initialized is False
+
+    # Stage 4: stateless mode (session_id=None) is always False.
+    model = provider.model("claude-haiku-4-5")
+    assert model._session_initialized is False
+
+
 def test_anthropic_subprocess_env_inherits_real_home_when_tmpdir_none() -> None:
     """Session-persistent + single-account: ``tmpdir=None`` means the
     subprocess inherits the operator's real HOME so native tools (Bash,

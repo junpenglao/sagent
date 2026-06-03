@@ -744,35 +744,44 @@ def _build_http_app(agents):
                 except json.JSONDecodeError:
                     continue
 
+        # ``total`` is ALWAYS the on-disk count (post-fix 2026-06-03).
+        # The previous shape returned ``total = len(events)`` AFTER
+        # tail-truncation to the limit, so once a trace file grew past
+        # ``limit`` events, the reported total froze at ``limit`` and
+        # the frontend's "did anything new arrive?" check
+        # (``total > traceTotal``) never fired -- panel stuck.
+        total_on_disk = len(events)
         qp = request.query_params
         if "around" in qp:
-            total = len(events)
             try:
                 around = int(qp["around"])
             except ValueError:
-                around = total - 1
+                around = total_on_disk - 1
             try:
                 ctx = max(0, min(200, int(qp.get("ctx", "14"))))
             except ValueError:
                 ctx = 14
             start = max(0, around - ctx)
-            end = min(total, around + ctx + 1)
+            end = min(total_on_disk, around + ctx + 1)
             return JSONResponse({
                 "events": events[start:end],
                 "offset": start,
-                "total": total,
+                "total": total_on_disk,
                 "hit": around,
             })
 
-        # Default: tail of the last 500 events. Light enough for the
-        # debug page's initial render.
+        # Default: tail of the last N events. Cap raised from 500
+        # → 2000 so a busy multi-hour TL session fits comfortably.
         try:
-            limit = max(1, min(5000, int(qp.get("limit", "500"))))
+            limit = max(1, min(20000, int(qp.get("limit", "2000"))))
         except ValueError:
-            limit = 500
-        if len(events) > limit:
-            events = events[-limit:]
-        return JSONResponse({"events": events, "total": len(events)})
+            limit = 2000
+        sliced = events[-limit:] if total_on_disk > limit else events
+        return JSONResponse({
+            "events": sliced,
+            "total": total_on_disk,
+            "returned": len(sliced),
+        })
 
     async def post(request: Request) -> Response:
         """Operator ingress + cross-process peer routing.

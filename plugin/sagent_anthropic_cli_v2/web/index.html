@@ -1302,7 +1302,7 @@ async function openTrace(role) {
   if (m) m.classList.add('active');
 
   try {
-    const r = await fetch(`/api/trace/${role}`);
+    const r = await fetch(`/api/trace/${role}?limit=2000`);
     if (r.status === 404) {
       traceBody.innerHTML =
         `<div class="ev">no trace file at sessions/${role}.trace.jsonl
@@ -1319,12 +1319,18 @@ async function openTrace(role) {
     return;
   }
 
-  // Poll the tail for new events. Cheap because trace files grow slowly
-  // and we cap the response at ?limit=500.
+  // Poll the tail for new events. The backend's ``total`` is now the
+  // on-disk count (NOT the post-truncation slice length), so the
+  // ``total > traceTotal`` check stays valid even after the file
+  // grows past the ?limit= window. We request a generous tail
+  // (?limit=2000) so we don't miss events between polls -- if more
+  // than 2000 events arrive in a 2-second window we'd undercount,
+  // but in practice agents emit a few dozen events per second at
+  // most.
   traceTimer = setInterval(async () => {
     if (!traceRole) return;
     try {
-      const r = await fetch(`/api/trace/${traceRole}?limit=500`);
+      const r = await fetch(`/api/trace/${traceRole}?limit=2000`);
       if (!r.ok) return;
       const data = await r.json();
       const total = data.total || (data.events || []).length;
@@ -1337,6 +1343,13 @@ async function openTrace(role) {
       tail.forEach(renderTraceEvent);
       traceTotal = total;
       traceCountEl.textContent = traceTotal + ' events';
+      // Cap the DOM at 2000 rendered events so a long-running session
+      // doesn't blow up the page. Drop the oldest from the top when
+      // we cross the cap.
+      const MAX_DOM_EVENTS = 2000;
+      while (traceBody.childElementCount > MAX_DOM_EVENTS) {
+        traceBody.removeChild(traceBody.firstElementChild);
+      }
       if (atBottom) traceBody.scrollTop = traceBody.scrollHeight;
     } catch (e) { /* swallow polling errors */ }
   }, 2000);

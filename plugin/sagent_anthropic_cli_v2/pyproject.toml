@@ -1,0 +1,23 @@
+[project]
+name = "blackjax-agent-team-sagent"
+version = "0.0.1"
+description = "Per-role sagent Agent factories for the BlackJAX dev team."
+requires-python = ">=3.12"
+dependencies = [
+    "sagent",
+]
+
+[tool.uv.sources]
+sagent = { git = "https://github.com/junpenglao/sagent.git", branch = "feat/cli-preempt-via-sigint" }
+
+# When the upstream PR at rekursiv-ai/sagent merges, switch to:
+#   sagent = ">=<NEXT_RELEASE_VERSION>"
+# and archive the feat/cli-preempt-via-sigint branch on the fork.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["roles*", "tests*"]

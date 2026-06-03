@@ -609,9 +609,18 @@ class _AnthropicCLIModel:
                 "AnthropicCLI(session_persistent): stream() called with no "
                 "new user-like entries to send",
             )
+        # Bridge MUST be populated before the subprocess spawns: the
+        # CLI issues ``ListToolsRequest`` against the bridge soon
+        # after launch, and if our tool catalog isn't there at that
+        # moment, opus falls back to emitting tool calls as plain
+        # text inside the assistant message (Episode 2.7 pathology
+        # — observed 2026-06-02 23:16 when TL produced
+        # "Bash {command: ls -la …}" as text instead of a tool_use
+        # block on the first turn after refactor).
+        await self._ensure_tools_bridge()
+        self._sync_tools_bridge(request)
         proc = await self._spawn_initialized()
         self._active_proc = proc
-        self._sync_tools_bridge(request)
         try:
             for entry in user_like_entries[:-1]:
                 await self._send_entry(proc, entry)
@@ -684,6 +693,23 @@ class _AnthropicCLIModel:
         """Refresh the MCP bridge's tool registry to match the request."""
         if self._tools_bridge is not None:
             self._tools_bridge.update_tools(list(request.tools or []))
+
+    async def _ensure_tools_bridge(self) -> None:
+        """Lazily create the MCP bridge (without spawning the CLI).
+
+        The bridge MUST exist before the first ``claude --print``
+        subprocess starts -- the CLI does ``ListToolsRequest`` against
+        the bridge URL soon after launch, and an empty bridge produces
+        an empty tool catalog (which then makes opus emit tool calls
+        as plain text). In the stateless path this is implicit because
+        the HotSpare's first spawn calls ``_spawn_initialized`` which
+        creates the bridge; in session-persistent mode we must hoist
+        the bridge creation out so the spawn argv can use a real
+        ``--mcp-config`` URL.
+        """
+        if self._tools_bridge is None:
+            self._tools_bridge = ToolsBridge(tools=[])
+            await self._tools_bridge.start()
 
     async def _exchange_turn(
         self,
@@ -1011,8 +1037,22 @@ def _build_anthropic_argv(
         "--mcp-config",
         mcp_config,
         "--strict-mcp-config",
-        "--tools",
-        "",
+    ])
+    # ``--tools ""`` historically meant "use the default allowlist" in
+    # stateless mode. In session-persistence mode (``--session-id`` /
+    # ``--resume``) the CLI re-interprets empty-string as "ALLOW NO
+    # TOOLS, including MCP ones" -- bisect probe 2026-06-03 found:
+    #
+    #   --tools ""              → no tool_use; opus replies "I'll run
+    #                             `ls /tmp`" as plain text.
+    #   (omit --tools entirely) → tool_use(name=Bash) emitted cleanly.
+    #   --tools "Bash"          → tool_use(name=Bash) emitted cleanly.
+    #
+    # We omit ``--tools`` in session-persistence mode and keep the
+    # empty-string in stateless mode (no observed regressions there).
+    if session_id is None:
+        base.extend(["--tools", ""])
+    base.extend([
         "--disable-slash-commands",
         "--permission-mode",
         "bypassPermissions",

@@ -278,37 +278,28 @@ async def call_tool(name: str, arguments: dict) -> list[mcp_types.ContentBlock]:
         return _text(status, is_error=not ok)
 
     if name == "sagent_self":
-        # Delegate to sagent's runtime status mechanism. Reaching into
-        # the runtime directly is intentional — the bridge-mounted
-        # AgentSelf tool would re-introduce the catalog-prefix
-        # problem the plugin exists to avoid. Same outcome, exposed
-        # under the ``mcp__sagent_chat__sagent_self`` name.
-        from sagent.tools.core import agent_registry
-        from sagent.types.runtime import Clear
-
-        target = agent_registry.get(sender)
-        if target is None:
-            return _text(
-                f"[Error] caller {sender!r} not in agent_registry.",
-                is_error=True,
-            )
+        # NB: this MCP server runs as a SEPARATE Python process spawned
+        # by claude --print's --mcp-config — its ``agent_registry``
+        # is a fresh, empty module-level dict, distinct from the live
+        # registry that ``serve.py`` owns. So we can't reach the live
+        # runtime from here to set ``runtime.status`` directly.
+        #
+        # For warmup the round-trip just needs to ack so the model
+        # ends the turn (the bootstrap directive requires a single
+        # tool call and "ok"). For real status changes the operator
+        # path is the web UI / ``/api/restart`` -- ``sagent_self``
+        # has no live-runtime equivalent on a session-persistent
+        # subprocess.
+        #
+        # Return a benign no-op ack. ``status`` / ``context`` args
+        # are echoed back so the model can verify the call was seen.
         status_text = arguments.get("status")
         context = arguments.get("context")
         notes: list[str] = []
         if status_text:
-            # Mirror sagent.tools.agent_self: status updates land on
-            # ``runtime.status`` if present. We just publish a status
-            # event via the runtime's event bus.
-            try:
-                target.runtime.status = str(status_text)
-                notes.append(f"status set to {status_text!r}")
-            except AttributeError:
-                notes.append("status: runtime has no .status attr (no-op)")
-        if context == "clear":
-            target.runtime.inbox.push_back(Clear())
-            notes.append("queued context clear")
-        elif context in ("compact", "recompact"):
-            notes.append(f"context {context} requested (not yet wired)")
+            notes.append(f"status acknowledged: {status_text!r}")
+        if context:
+            notes.append(f"context arg acknowledged: {context!r}")
         if not notes:
             notes.append("no-op")
         return _text("; ".join(notes))

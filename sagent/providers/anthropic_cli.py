@@ -751,6 +751,13 @@ class _AnthropicCLIModel:
         """Read stream events until ``result``; assemble a ``ModelResponse``."""
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        # Per-block-index state for tool_use accumulators. Each
+        # ``content_block_start`` for a ``tool_use`` registers
+        # ``{name, id, json_parts: list[str]}`` keyed by block index;
+        # streamed ``input_json_delta`` deltas append to ``json_parts``;
+        # ``content_block_stop`` finalises and emits a ToolLabel with
+        # the parsed args.
+        tool_use_blocks: dict[int, dict[str, object]] = {}
         usage_event: MutableJSON | None = None
         message_id = ""
         stop_reason: str | None = None
@@ -774,6 +781,7 @@ class _AnthropicCLIModel:
                     cast(MutableJSON, event.get("event") or {}),
                     text_parts,
                     thinking_parts,
+                    tool_use_blocks,
                     on_text,
                     on_thinking,
                 )
@@ -1114,24 +1122,111 @@ def _dispatch_stream_event(
     event: MutableJSON,
     text_parts: list[str],
     thinking_parts: list[str],
+    tool_use_blocks: dict[int, dict[str, object]],
     on_text: Callable[[str], None] | None,
     on_thinking: Callable[[str], None] | None,
 ) -> None:
-    """Route one stream_event payload to ``on_text`` / ``on_thinking``."""
-    delta = cast(MutableJSON, event.get("delta") or {})
-    delta_type = delta.get("type")
-    if delta_type == "text_delta":
-        text = cast(str, delta.get("text") or "")
-        if text:
-            text_parts.append(text)
-            if on_text is not None:
-                on_text(text)
-    elif delta_type == "thinking_delta":
-        text = cast(str, delta.get("thinking") or "")
-        if text:
-            thinking_parts.append(text)
-            if on_thinking is not None:
-                on_thinking(text)
+    """Route one stream_event payload to ``on_text`` / ``on_thinking``.
+
+    Also accumulates ``tool_use`` content blocks across their start /
+    streamed ``input_json_delta`` chunks / stop events, and emits one
+    ``ToolLabel`` per tool call at block-stop with ``name`` plus a
+    short rendering of the JSON args (e.g. ``Bash ls -la`` or
+    ``Read foo.py``). Published via :data:`cli_publish_var` so the
+    trace panel surfaces what tools the model is invoking. Covers
+    both bridge-mounted tools (Bash, Read, ...) and external-MCP
+    tools (``mcp__sagent_chat__sagent_send``, ...) uniformly --
+    in stateless mode the bridge ALSO publishes labels for its own
+    tools, so bridge-mounted tools get logged twice; the trace
+    renderer treats each ToolLabel as a separate event.
+    """
+    event_type = event.get("type")
+    if event_type == "content_block_start":
+        idx = int(cast(int, event.get("index") or 0))
+        block = cast(MutableJSON, event.get("content_block") or {})
+        if block.get("type") == "tool_use":
+            tool_use_blocks[idx] = {
+                "name": cast(str, block.get("name") or "?"),
+                "id": cast(str, block.get("id") or ""),
+                "json_parts": [],
+            }
+        return
+    if event_type == "content_block_delta":
+        delta = cast(MutableJSON, event.get("delta") or {})
+        delta_type = delta.get("type")
+        if delta_type == "input_json_delta":
+            idx = int(cast(int, event.get("index") or 0))
+            state = tool_use_blocks.get(idx)
+            if state is not None:
+                partial = cast(str, delta.get("partial_json") or "")
+                cast(list, state["json_parts"]).append(partial)
+            return
+        if delta_type == "text_delta":
+            text = cast(str, delta.get("text") or "")
+            if text:
+                text_parts.append(text)
+                if on_text is not None:
+                    on_text(text)
+            return
+        if delta_type == "thinking_delta":
+            text = cast(str, delta.get("thinking") or "")
+            if text:
+                thinking_parts.append(text)
+                if on_thinking is not None:
+                    on_thinking(text)
+            return
+        return
+    if event_type == "content_block_stop":
+        idx = int(cast(int, event.get("index") or 0))
+        state = tool_use_blocks.pop(idx, None)
+        if state is None:
+            return
+        tool_name = cast(str, state["name"])
+        tool_id = cast(str, state["id"])
+        json_parts = cast(list, state["json_parts"])
+        args_summary = _render_tool_args(tool_name, "".join(json_parts))
+        label_text = f"{tool_name} {args_summary}".rstrip()
+        try:
+            from sagent.agent.runtime import cli_publish_var
+            from sagent.types.runtime import ToolLabel
+
+            publish = cli_publish_var.get()
+            if publish is not None:
+                publish(ToolLabel(call_id=tool_id, text=label_text))
+        except Exception:  # noqa: BLE001 -- never let a label publish break the stream
+            logger.debug("failed to publish ToolLabel for %r", tool_name, exc_info=True)
+        return
+
+
+def _render_tool_args(name: str, raw_json: str) -> str:
+    """Render tool input JSON as a short label suffix.
+
+    Best-effort: if the JSON is incomplete (streaming aborted mid-flight)
+    or unparseable, falls back to a truncated raw form. Common args
+    (``command``, ``file_path``, ``pattern``, ``query``, ``to``,
+    ``content``) get a friendly rendering; unknown tools fall back to
+    the raw arg dict.
+    """
+    if not raw_json:
+        return ""
+    try:
+        args = json.loads(raw_json)
+    except (json.JSONDecodeError, ValueError):
+        snippet = raw_json[:80].replace("\n", " ")
+        return f"({snippet}…)" if len(raw_json) > 80 else f"({snippet})"
+    if not isinstance(args, dict):
+        return str(args)[:80]
+    for key in ("command", "file_path", "path", "pattern", "query", "to"):
+        if key in args and isinstance(args[key], str):
+            val = args[key]
+            return val if len(val) <= 120 else val[:120] + "…"
+    if "content" in args and isinstance(args["content"], str):
+        val = args["content"]
+        return val if len(val) <= 120 else val[:120] + "…"
+    rendered = ", ".join(
+        f"{k}={str(v)[:40]!r}" for k, v in list(args.items())[:3]
+    )
+    return rendered[:120]
 
 
 def _build_model_response(

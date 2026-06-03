@@ -39,6 +39,36 @@ async def test_write_and_read_json_round_trip(tmp_path: Path) -> None:
     del tmp_path
 
 
+@pytest.mark.asyncio
+async def test_read_json_line_handles_record_larger_than_default_buffer(
+    tmp_path: Path,
+) -> None:
+    """A single NDJSON record > 64 KiB must NOT trip
+    ``asyncio.LimitOverrunError``.
+
+    ``Subproc.read_line()`` uses ``StreamReader.readline()``, which
+    defaults to a 64 KiB per-line buffer and raises ``ValueError:
+    Separator is found, but chunk is longer than limit`` for larger
+    lines. The ``claude --print --output-format stream-json``
+    subprocess emits one NDJSON record per content block; reading a
+    large file (the failure mode TL diagnosed live 2026-06-03 with
+    back-to-back 41 KiB + 22 KiB worklog threads) easily exceeds
+    64 KiB on a single line. Fixed by passing ``limit=`` to
+    ``create_subprocess_exec``.
+    """
+    payload = {"big": "x" * (250_000)}  # one record ~250 KiB
+    proc = Subproc(["python3", "-c", "import sys; sys.stdout.write(sys.stdin.read())"])
+    await proc.start()
+    await proc.write_line(json.dumps(payload))
+    assert proc._proc is not None
+    assert proc._proc.stdin is not None
+    proc._proc.stdin.close()
+    msg = await proc.read_json_line()
+    assert msg == payload
+    await proc.close()
+    del tmp_path
+
+
 def test_interrupt_returns_false_before_start() -> None:
     """``interrupt`` on a never-started Subproc is a safe no-op."""
     proc = Subproc(["python3", "-c", "pass"])

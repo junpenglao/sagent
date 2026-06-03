@@ -1103,7 +1103,6 @@ def _anthropic_subprocess_env(
         env["USERPROFILE"] = str(tmpdir)
     env.update(
         {
-            "DISABLE_AUTO_COMPACT": "1",
             "DISABLE_TELEMETRY": "1",
             "DISABLE_ERROR_REPORTING": "1",
             "DISABLE_AUTOUPDATER": "1",
@@ -1116,6 +1115,17 @@ def _anthropic_subprocess_env(
             "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS": "1",
         }
     )
+    # Auto-compact:
+    #   - Stateless mode (sagent owns history via re-feed): keep
+    #     ``DISABLE_AUTO_COMPACT=1`` so claude's compactor doesn't
+    #     race sagent's ``SummaryCompactor``.
+    #   - Session-persistent mode: sagent doesn't own history, claude
+    #     does. LET claude's own compactor run -- otherwise a long
+    #     session walks into ``terminal_reason: blocking_limit`` and
+    #     the session JSONL ends with ``"Prompt is too long"`` on
+    #     every ``--resume`` (SWE failure 2026-06-03 ~08:46-08:54).
+    if not persist_session:
+        env["DISABLE_AUTO_COMPACT"] = "1"
     if not persist_session:
         env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
     return env

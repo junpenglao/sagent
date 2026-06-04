@@ -258,6 +258,45 @@ def build_provider():
     raise RuntimeError(f"Unsupported SAGENT_API_PROVIDER: {_PROVIDER!r}")
 
 
+def _build_compactor():
+    """Construct a SummaryCompactor with conservative thresholds.
+
+    sagent's default ``utilization_trigger=0.95`` fires when the
+    request fills 95% of the model's context window. For Gemini's
+    1 M context this is ~950 K tokens — too close to the wall.
+    v2 hit ``blocking_limit`` at ~1.5 M (claude's auto-compact
+    couldn't reduce enough); we want headroom before v3 sees the
+    same pattern.
+
+    Conservative settings:
+
+    * ``utilization_trigger=0.7`` — fire at 70% of window (~700 K
+      tokens for Gemini). Leaves the agent ~30% of the window to
+      breathe after compaction; the SummaryCompactor compresses
+      ~10× so the post-compaction request size drops well below
+      the trigger.
+    * ``keep_recent=20`` — preserve the last 20 conversation
+      entries uncompacted so the agent doesn't lose
+      situational context across a compaction. ~20 turns is
+      enough to hold a multi-step coordination chain in working
+      memory.
+    * ``proactive=False`` — only compact when the trigger fires
+      (not on every turn). Saves a model call per turn vs
+      ``proactive=True``.
+
+    Returns a fresh instance per agent (the compactor's CompactionState
+    is managed by the runtime, not the instance itself; instances
+    are config holders, safe to share but cheap to recreate).
+    """
+    from sagent.compaction.summary import SummaryCompactor
+
+    return SummaryCompactor(
+        utilization_trigger=0.7,
+        keep_recent=20,
+        proactive=False,
+    )
+
+
 def _model_spec_for(model_id: str):
     """Build a ``ModelSpec`` that lets ``AgentSelf`` swap the model later.
 
@@ -369,6 +408,7 @@ def build_agent(
         model_spec=_model_spec_for(model_id),
         system=load_system_prompt(role_md_path),
         tools=list(tools),
+        compactor=_build_compactor(),
         name=role_name,
         session_dir=session_dir,
         max_tool_call_rounds=max_tool_call_rounds,

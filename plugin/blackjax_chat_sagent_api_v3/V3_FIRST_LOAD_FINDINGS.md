@@ -79,6 +79,41 @@ model or tightening the role brief.
 (`/api/trace/tl`) in addition to the main chat — TL's responses
 may appear there but not in the chat.
 
+## Worklog-driven tests against v2's failure-mode catalog
+
+Worklog
+`2026-06-03-sagent-chat-runtime-reliability-failure-modes.md` lists
+8 distinct v1/v2 failure modes. Mapping them against v3:
+
+| # | v2 failure | v3 status |
+|---|---|---|
+| 1 | "No such tool available" MCP races | ❌ N/A — no MCP in v3 |
+| 2 | Arg-type error mis-reported as missing tool | ❌ N/A — different wire format |
+| **3** | **Message loss across server restart** | ✅ **PASSED** — sent 3 tokens, SIGKILLed server, restarted, TL recalled all 3 |
+| 4 | Multi-fork bootstrap collision | ⚠️ in-process; less risk but not stress-tested |
+| 5 | Full history loss / peer-query recovery | Partial — `agent.resume()` works; deliberate session deletion not tested in v3 |
+| **6** | **Multi-part message partial delivery** | ✅ **PASSED** — sent TL→SWE with DATA + NARRATIVE + CITATION blocks (411 chars), SWE replied "Received all three sections" intact |
+| 7 | Crossed messages / re-send to override | Structurally addressed via `urgent` flag (sagent core); not pattern-tested |
+| 8 | Defer-contention polling | Not tested; sagent's `AgentSend(delay=...)` is the equivalent mechanism |
+
+**Critical gap: NO compactor wired in `build_agent`.**
+`sagent.compaction.summary.SummaryCompactor` exists but isn't passed
+to the Agent constructor. v2 hit `blocking_limit` at ~1.5 M tokens
+on opus's 1 M context window; Gemini-2.5-flash and flash-lite also
+have 1 M context.
+
+For day-1 testing this won't bite (sessions are small). For
+sustained use the operator should wire SummaryCompactor before
+crossing ~700 K tokens. ~5-line change in `build_agent`:
+
+```python
+from sagent.compaction.summary import SummaryCompactor
+agent = Agent(
+    ...,
+    compactor=SummaryCompactor(...),  # check the constructor signature
+)
+```
+
 ## What's not yet tested
 
 - **`urgent` flag on peer messages**: sagent's native `AgentSend`

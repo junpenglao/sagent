@@ -97,7 +97,6 @@ class AuditWriter:
             return
         msg = event.message
         records: list[dict[str, object]] = []
-        addressed_to: set[str] = set()
         for tc in msg.tool_calls:
             if tc.name != "AgentSend":
                 continue
@@ -112,32 +111,24 @@ class AuditWriter:
                 "to": [to],
                 "body": content,
             })
-            addressed_to.add(to)
-        # Text-only fallback for the operator-reply case:
+        # Canonical v1/v2 design (restored 2026-06-04 17:xx UTC):
+        # ONLY explicit ``AgentSend`` tool calls land in the audit
+        # log + web UI. Assistant text without an AgentSend stays in
+        # the trace ONLY (operator can open the trace panel for
+        # debugging when they suspect a model emitted prose instead
+        # of calling the tool).
         #
-        # Models (especially when asked a simple conversational
-        # question like "hello") sometimes emit assistant text and
-        # NO AgentSend call — the operator's web UI reads from
-        # main.jsonl and would see nothing. Synthesize a synthetic
-        # ``to=user`` record from the assistant text so the operator
-        # sees the reply.
-        #
-        # Suppression rules:
-        # - Only fire if ``user`` wasn't already an explicit
-        #   AgentSend target (don't duplicate when the model did
-        #   call AgentSend(to='user', ...) AND ALSO emit a summary
-        #   text).
-        # - Don't fire when there's no text at all (skip empty
-        #   "ok" turns that produced only tool_use blocks).
-        text = (msg.text or "").strip()
-        if text and "user" not in addressed_to:
-            records.append({
-                "ts": _iso8601_z(),
-                "from": self.role_name,
-                "to": ["user"],
-                "body": text,
-                "synthetic": True,  # marks the text-only fallback path
-            })
+        # An earlier iteration synthesized a ``to=user`` record from
+        # any non-empty assistant text in turns that didn't address
+        # ``user`` via AgentSend. That worked as a safety net when
+        # TL was on gemini-2.5-flash and would empty-respond or
+        # text-respond instead of calling the tool. After upgrading
+        # TL to gemini-2.5-pro the tool-use behaviour became
+        # reliable, but the synthetic fallback ALSO captured TL's
+        # post-action narration ("Thank you for the question, I've
+        # forwarded it to @swe...") and leaked it to the chat. The
+        # operator's expectation is right: silence means the model
+        # didn't intend to message them.
         # Note: ``urgent`` is intentionally not surfaced here. The
         # operator can opt in to plumbing it once sagent's
         # AgentSend exposes the flag (see "deferred" item in the

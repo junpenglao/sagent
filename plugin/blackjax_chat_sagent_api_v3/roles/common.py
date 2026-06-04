@@ -144,6 +144,16 @@ the tool means the recipient never receives the message. There is \
 no `@mention`-based prose parser. There is no DM-default fallback. \
 The structured tool call IS the only routing.
 
+**This applies to the user too.** To reply to the user, call \
+`AgentSend(to="user", content=...)` — your assistant text is NOT \
+shown in their chat UI. The user only sees explicit AgentSend \
+calls. If you finish a tool sequence and want to confirm \
+completion to the user, call `AgentSend(to="user", ...)` once \
+with the result; do NOT write a narrative summary of "here's what \
+I just did" in your text content blocks — it will not be \
+delivered. Silence is honest feedback that you didn't intend to \
+message anyone this turn.
+
 **Common failure mode (do not do this):** writing text like \
 "I'll send the summary to @user" or "Let me send a message to @swe" \
 without actually calling `AgentSend`. Describing the call does \

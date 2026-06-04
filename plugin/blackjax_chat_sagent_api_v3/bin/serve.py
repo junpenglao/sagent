@@ -286,8 +286,16 @@ def make_app(agents: dict[str, object]):
         return JSONResponse({"messages": out, "now": _iso8601_z()})
 
     async def get_members(request: Request) -> Response:
+        """Roles list for the UI's members panel.
+
+        v3 exposes BOTH ``/api/members`` and ``/api/roles`` because
+        the web UI (copied verbatim from v2) calls ``/api/roles``
+        and unpacks ``data.roles``. Returning both keys in a single
+        response so the same handler serves both paths.
+        """
         del request
-        return JSONResponse({"members": sorted(agents) + ["user"]})
+        roles = sorted(agents) + ["user"]
+        return JSONResponse({"roles": roles, "members": roles})
 
     async def get_trace(request: Request) -> Response:
         role = request.path_params["role"]
@@ -349,6 +357,7 @@ def make_app(agents: dict[str, object]):
         Route("/api/post", post, methods=["POST"]),
         Route("/api/messages", get_messages),
         Route("/api/members", get_members),
+        Route("/api/roles", get_members),
         Route("/api/trace/{role}", get_trace),
         Route("/api/restart", restart, methods=["POST"]),
     ]

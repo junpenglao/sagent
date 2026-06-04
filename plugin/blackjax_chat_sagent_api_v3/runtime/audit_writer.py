@@ -96,6 +96,8 @@ class AuditWriter:
         if not isinstance(event, ModelResponseComplete):
             return
         msg = event.message
+        records: list[dict[str, object]] = []
+        addressed_to: set[str] = set()
         for tc in msg.tool_calls:
             if tc.name != "AgentSend":
                 continue
@@ -104,24 +106,53 @@ class AuditWriter:
             content = str(args.get("content", ""))
             if not to or not content:
                 continue
-            record = {
+            records.append({
                 "ts": _iso8601_z(),
                 "from": self.role_name,
                 "to": [to],
                 "body": content,
-            }
-            # Note: ``urgent`` is intentionally not surfaced here. The
-            # operator can opt in to plumbing it once sagent's
-            # AgentSend exposes the flag (see "deferred" item in the
-            # v3 research notes).
-            try:
-                with self.audit_log.open("a", encoding="utf-8") as f:
+            })
+            addressed_to.add(to)
+        # Text-only fallback for the operator-reply case:
+        #
+        # Models (especially when asked a simple conversational
+        # question like "hello") sometimes emit assistant text and
+        # NO AgentSend call — the operator's web UI reads from
+        # main.jsonl and would see nothing. Synthesize a synthetic
+        # ``to=user`` record from the assistant text so the operator
+        # sees the reply.
+        #
+        # Suppression rules:
+        # - Only fire if ``user`` wasn't already an explicit
+        #   AgentSend target (don't duplicate when the model did
+        #   call AgentSend(to='user', ...) AND ALSO emit a summary
+        #   text).
+        # - Don't fire when there's no text at all (skip empty
+        #   "ok" turns that produced only tool_use blocks).
+        text = (msg.text or "").strip()
+        if text and "user" not in addressed_to:
+            records.append({
+                "ts": _iso8601_z(),
+                "from": self.role_name,
+                "to": ["user"],
+                "body": text,
+                "synthetic": True,  # marks the text-only fallback path
+            })
+        # Note: ``urgent`` is intentionally not surfaced here. The
+        # operator can opt in to plumbing it once sagent's
+        # AgentSend exposes the flag (see "deferred" item in the
+        # v3 research notes).
+        if not records:
+            return
+        try:
+            with self.audit_log.open("a", encoding="utf-8") as f:
+                for record in records:
                     f.write(json.dumps(record) + "\n")
-            except OSError as exc:
-                logger.warning(
-                    "audit_writer: failed to append %s -> %s: %s",
-                    self.role_name, to, exc,
-                )
+        except OSError as exc:
+            logger.warning(
+                "audit_writer: failed to append %s records: %s",
+                self.role_name, exc,
+            )
 
 
 def install_on(agent: Any, role_name: str, *, audit_log_path: Path | None = None) -> AuditWriter:  # noqa: ANN401

@@ -7392,7 +7392,12 @@ async def test_preempt_in_flight_does_not_cancel_on_routine_agent_send_mid_strea
 @pytest.mark.asyncio
 @pytest.mark.real_sleep
 async def test_preempt_in_flight_calls_cancel_on_user_message_mid_stream() -> None:
-    """UserMessage mid-stream also triggers cancel when preempt_in_flight is enabled."""
+    """``UserMessage`` mid-stream triggers cancel when ``preempt_in_flight=True``.
+
+    Default ``UserMessage.urgent=True`` preserves the historical
+    behaviour: tests + internal sagent callers that construct a
+    ``UserMessage`` without specifying urgency still preempt.
+    """
     model = _CancellableBlockingModel()
     agent = agent_runtime.AgentRuntime(model=model, preempt_in_flight=True)
     collector = EventCollector()
@@ -7409,6 +7414,69 @@ async def test_preempt_in_flight_calls_cancel_on_user_message_mid_stream() -> No
     )
 
     assert len(model.cancel_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_sleep
+async def test_preempt_in_flight_does_not_cancel_on_non_urgent_user_message_mid_stream() -> None:
+    """``UserMessage(urgent=False)`` mid-stream does NOT trigger cancel
+    even with ``preempt_in_flight=True``.
+
+    This is the plugin-layer "queue operator messages by default"
+    contract: the web UI / HTTP ingress can opt operator messages
+    into buffer-and-drain semantics so back-to-back operator typing
+    doesn't waste the recipient's in-flight compute on routine
+    follow-ups. Companion to the routine-peer-no-preempt test above.
+    """
+    cancel_calls: list[float] = []
+    started = asyncio.Event()
+
+    @dataclass(kw_only=True, slots=True)
+    class _NaturalCompletionModel:
+        async def stream(
+            self,
+            history: list[ModelContextEvent],
+            on_text: Callable[[str], None],
+            on_thinking: Callable[[str], None],
+        ) -> AssistantMessage:
+            del history, on_thinking
+            started.set()
+            await asyncio.sleep(1.0)
+            for ch in "ok":
+                on_text(ch)
+            return AssistantMessage(text="ok")
+
+        def cancel_in_flight(self) -> bool:
+            cancel_calls.append(0.0)
+            return True
+
+    model = _NaturalCompletionModel()
+    agent = agent_runtime.AgentRuntime(model=model, preempt_in_flight=True)
+    collector = EventCollector()
+    agent.observers.append(collector)
+    agent.inbox.push_back(UserMessage(text="start"))
+
+    async def send_routine_followup() -> None:
+        await started.wait()
+        agent.inbox.push_back(
+            UserMessage(text="also, fyi: I wanted to add context.", urgent=False),
+        )
+
+    await asyncio.gather(
+        run_with_quit(agent, timeout_sec=5.0),
+        send_routine_followup(),
+    )
+
+    assert len(cancel_calls) == 0, (
+        f"non-urgent UserMessage should NOT call cancel_in_flight; "
+        f"got {len(cancel_calls)} calls"
+    )
+    # The buffered follow-up must still reach history.
+    users = [m for m in agent.context().messages if isinstance(m, UserMessage)]
+    assert any("fyi" in m.text for m in users), (
+        f"queued non-urgent UserMessage did not reach history; "
+        f"got {[m.text for m in users]!r}"
+    )
 
 
 @pytest.mark.asyncio

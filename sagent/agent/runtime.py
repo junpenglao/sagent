@@ -2006,13 +2006,20 @@ class AgentRuntime:
                                 # the coalesced UserMessage is published --
                                 # at which point the preview drops because the
                                 # buffer is empty. One UI surface at a time.
-                                # If ``preempt_in_flight`` is enabled,
-                                # additionally SIGINT the provider so a
-                                # CLI-driven opaque turn aborts immediately
-                                # rather than waiting for natural completion;
-                                # see AgentSendMessage handler below for the
-                                # rationale and failure mode.
-                                if self._preempt_in_flight:
+                                # If ``preempt_in_flight`` is enabled AND the
+                                # message is flagged ``urgent`` (the historical
+                                # default, preserved for tests/internal
+                                # callers that don't specify), additionally
+                                # SIGINT the provider so a CLI-driven opaque
+                                # turn aborts immediately rather than waiting
+                                # for natural completion. ``urgent=False`` lets
+                                # ingress layers (e.g. plugin web UIs) opt
+                                # operator messages into queue-by-default so
+                                # back-to-back operator typing doesn't waste
+                                # the recipient's in-flight compute on routine
+                                # follow-ups; see AgentSendMessage handler
+                                # below for the symmetric peer case.
+                                if self._preempt_in_flight and item.urgent:
                                     cancel = getattr(
                                         self.model, "cancel_in_flight", None,
                                     )

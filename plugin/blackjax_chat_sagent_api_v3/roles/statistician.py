@@ -19,7 +19,10 @@ def build():
 
     Model: cheapest tier for the active provider.
     """
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from sagent import tools
+    from sandboxed_tools import SandboxedBash
 
     return build_agent(
         role_name="statistician",
@@ -28,7 +31,7 @@ def build():
             tools.Read(),
             tools.Edit(),
             tools.Write(),
-            tools.Bash(),
+            SandboxedBash(),
             tools.Grep(),
             tools.Glob(),
             tools.AgentSend(),

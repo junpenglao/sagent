@@ -22,7 +22,10 @@ def build():
     Model: 2nd-cheapest tier for the active provider (see
     ``MODEL_TL`` in common.py).
     """
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from sagent import tools
+    from sandboxed_tools import SandboxedBash
 
     return build_agent(
         role_name="tl",
@@ -31,7 +34,7 @@ def build():
             tools.Read(),
             tools.Grep(),
             tools.Glob(),
-            tools.Bash(),
+            SandboxedBash(),
             tools.AgentSend(),
             tools.AgentSelf(),
         ],

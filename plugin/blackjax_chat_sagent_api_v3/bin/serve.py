@@ -267,7 +267,14 @@ def make_app(agents: dict[str, object]):
         return JSONResponse({"ok": True, "to": to, "from": from_role})
 
     async def get_messages(request: Request) -> Response:
-        """Tail the audit log. Optional ``?since=<iso8601>`` for delta polling."""
+        """Tail the audit log. Optional ``?since=<iso8601>`` for delta polling.
+
+        Returns BOTH ``records`` and ``messages`` keys so the web UI
+        works either way. v2's index.html polls ``data.records`` only
+        (no ``messages`` fallback), so the v3 chat looked frozen until
+        the operator hit refresh — same bug shape as /api/roles vs
+        /api/members.
+        """
         since = request.query_params.get("since", "")
         out = []
         if _AUDIT_LOG.exists():
@@ -283,7 +290,11 @@ def make_app(agents: dict[str, object]):
                     if since and r.get("ts", "") <= since:
                         continue
                     out.append(r)
-        return JSONResponse({"messages": out, "now": _iso8601_z()})
+        return JSONResponse({
+            "records": out,
+            "messages": out,
+            "now": _iso8601_z(),
+        })
 
     async def get_members(request: Request) -> Response:
         """Roles list for the UI's members panel.

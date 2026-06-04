@@ -40,14 +40,28 @@ from typing import Any
 # at module load — lives in the same Python process as ``serve.py``
 # so the env-resolved value reflects the launching process's
 # environment.
+import os
 import sys
 
 _plugin_root = Path(__file__).resolve().parent.parent
 if str(_plugin_root) not in sys.path:
     sys.path.insert(0, str(_plugin_root))
-from mcp_sagent import delivery  # noqa: E402
 
-_SESSIONS_DIR = delivery.SESSIONS_DIR
+
+def _resolve_sessions_dir() -> Path:
+    """Same SAGENT_DATA_DIR resolution as ``bin/serve.py``.
+
+    v2 went through ``mcp_sagent/delivery.py`` for this; v3 has no
+    MCP module, so we inline the lookup. Behaviour identical:
+    ``$SAGENT_DATA_DIR/sessions`` if the env var is set; otherwise
+    ``<plugin>/sessions``.
+    """
+    env = os.environ.get("SAGENT_DATA_DIR")
+    base = Path(env).expanduser().resolve() if env else _plugin_root
+    return base / "sessions"
+
+
+_SESSIONS_DIR = _resolve_sessions_dir()
 
 
 def _iso_now() -> str:

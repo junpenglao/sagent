@@ -81,8 +81,16 @@ _PROVIDER = os.environ.get("SAGENT_API_PROVIDER", "google").lower()
 _PROVIDER_MODELS: dict[str, tuple[str, str]] = {
     # provider -> (tl_model, default_model)
     "google": (
-        "gemini-2.5-flash-lite",  # TL: $0.10 / Mtok in, newer arch
-        "gemini-1.5-flash",       # default: $0.075 / Mtok in, cheapest
+        # NOTE 2026-06-04: ``gemini-1.5-flash`` (the absolute cheapest
+        # tier at $0.075 / Mtok in) is gone from the live API — calls
+        # return 404. Sagent's KNOWN_MODELS catalog still lists it
+        # but Google has retired the public endpoint. So we step up
+        # one tier each side:
+        #   TL: gemini-2.5-flash ($0.30 / Mtok in — 2nd cheapest now)
+        #   default: gemini-2.5-flash-lite ($0.10 / Mtok in — cheapest
+        #            currently available + verified live)
+        "gemini-2.5-flash",       # TL
+        "gemini-2.5-flash-lite",  # default
     ),
     "anthropic": (
         # 2nd-cheapest + cheapest in Anthropic's catalog. Adjust if

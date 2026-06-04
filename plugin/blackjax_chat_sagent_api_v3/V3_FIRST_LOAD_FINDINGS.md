@@ -19,31 +19,45 @@ worth knowing going in.
 
 ## ⚠️ Findings the operator should know
 
-### Finding 1: gemini-2.5-flash sometimes empty-responds to natural-language coordination
+### Finding 1: gemini-2.5-flash fails natural-language coordination; gemini-2.5-pro works
 
-**Symptom**: when TL gets a natural-language coordination request like
-`"We need a quick coordination test, please send a message to @swe..."`, it
-sometimes produces `text='' tool_calls=[]` in ~1 second — completely silent,
-no dispatch. The operator's web UI would show only the request, no
-response.
+**Comparison run on identical prompt** (2026-06-04 15:42-15:46):
 
-**Workaround that works**: if the prompt is explicit and narrow
-(`"Call the AgentSend tool right now with arguments {to: 'swe', content: '...'}"`),
-TL dispatches correctly within 3 seconds.
+| Model | Behavior |
+|---|---|
+| `gemini-2.5-flash` (TL on $0.30/Mtok in) | ❌ `text='' tool_calls=[]` — silent failure |
+| `gemini-2.5-pro` (~4× the cost on input) | ✅ Full chain: dispatched to swe + statistician + status to user + summary |
 
-**Hypothesis**: cheap-tier Gemini follows narrow instructions reliably
-but doesn't reliably translate higher-level coordination intent into
-tool calls. Two paths to test:
+The empty-response is genuinely a **model-tier limit**, not a prompt
+issue. Same prompt, same role brief, same runtime — only the model
+changed.
 
-1. **Upgrade TL to gemini-2.5-pro** (10× input cost: $1.25/Mtok vs
-   $0.10) — might handle the natural-language case. Single-line
-   change in `roles/common.py` (`MODEL_TL = "gemini-2.5-pro"`).
-2. **Tweak the role brief** (`roles/tl.md`) to include explicit
-   coordination examples Gemini can copy. Cheaper but needs iteration.
+**Recommendation for the operator**: switch TL to
+`gemini-2.5-pro` for the live test. Single-line change in
+`roles/common.py`:
 
-The PEER_MESSAGING block in `roles/common.py` already says "use
-`AgentSend`, not prose" — gemini-2.5-flash just isn't following it
-on the coordination path.
+```python
+"google": (
+    "gemini-2.5-pro",         # TL (was: gemini-2.5-flash — empty-responded)
+    "gemini-2.5-flash-lite",  # default — keep
+),
+```
+
+**Cost implication**: TL on gemini-2.5-pro costs ~$1.25/Mtok input,
+$10/Mtok output (vs flash's $0.30/$2.50). For a typical coordination
+turn (~5-10K input tokens × $1.25/M = $0.006-0.012, plus output
+~500 tokens × $10/M = $0.005), each TL turn lands around $0.01-0.02.
+Multiplied by maybe 100 turns/day = $1-2/day on TL.
+
+The four non-TL agents stay on `gemini-2.5-flash-lite` ($0.10/Mtok
+in) — their tasks are simpler (acknowledgments, file edits, test
+runs) and don't suffer the natural-language-coordination failure
+mode.
+
+Even at the upgraded TL tier, v3 total day cost should land
+~$1-3/day vs v2's $6-15/day. The cheap-tier experiment did its
+job (showed where flash breaks); the right config for actual use
+is **pro for TL, flash-lite for the rest**.
 
 ### Finding 2: TL responses to operator sometimes come as text only
 

@@ -86,6 +86,90 @@ _CREDENTIALS_SCHEMA: JSON = {
 }
 
 
+class AnthropicCLIRetryableError(SubprocessTransportError):
+    """The CLI returned a transient ``is_error`` ``result`` event.
+
+    Distinguished from :class:`SubprocessTransportError` so the model's
+    :meth:`is_retryable_provider_error` can flag the call for in-place
+    retry by ``send_with_retry`` instead of propagating to the runtime
+    as a fatal ``ModelResponseError`` (which would burn a turn boundary
+    + pollute history with a synthetic ``[Error: ...]`` UserMessage).
+
+    See :func:`_is_event_retryable` for the catalog of shapes that are
+    treated as transient. Carries an optional ``retry_after_ms`` hint
+    extracted from the CLI event when present; ``send_with_retry`` will
+    fall back to standard exponential backoff if ``None``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_ms: float | None = None,
+        event: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_ms = retry_after_ms
+        self.event = event
+
+
+def _is_event_retryable(event: dict) -> bool:
+    """Classify a CLI ``result`` event as transient.
+
+    Validated against ~60 organic ``is_error`` events captured on
+    2026-06-03/04 from the live multi-agent server. The retryable
+    shapes share two attributes: (a) the model session is still
+    consistent (claude wrote partial assistant content to disk before
+    the stream aborted) and (b) re-running the same request usually
+    succeeds without operator intervention.
+
+    Retryable shapes:
+
+    * ``terminal_reason == "aborted_streaming"``: API-side mid-stream
+      cut, often paired with ``stop_reason == "tool_use"`` and an
+      ``[ede_diagnostic]`` entry in ``errors``. Dominant pattern in
+      today's data (~80% of TL/SWE error events).
+    * ``errors`` contains an ``[ede_diagnostic]`` line: same root
+      cause, occasionally reported with ``terminal_reason == "completed"``.
+
+    NOT retryable:
+
+    * ``terminal_reason == "blocking_limit"``: context overflow. The
+      next attempt would hit the same wall; operator must clear the
+      session. Surfacing as a hard error gets the runtime to publish
+      ``ModelResponseError`` so the operator sees ``status=hung``.
+    * ``api_error_status`` in non-429 4xx: client-side issue, retry
+      won't help.
+    """
+    terminal_reason = event.get("terminal_reason")
+    if terminal_reason == "aborted_streaming":
+        return True
+    if terminal_reason == "blocking_limit":
+        return False
+    errors = event.get("errors", [])
+    if isinstance(errors, list):
+        for err in errors:
+            if "ede_diagnostic" in str(err):
+                return True
+    return False
+
+
+def _extract_retry_after_ms(event: dict) -> float | None:
+    """Pull a millisecond retry hint out of the CLI ``result`` event.
+
+    The CLI sometimes embeds ``retry_after_ms`` / ``retry_delay_ms``
+    keys in the result envelope (mirroring the underlying API
+    ``retry-after`` header). When present we forward it to the retry
+    layer so backoff respects the server's hint; when absent
+    ``send_with_retry`` falls back to its standard exponential schedule.
+    """
+    for key in ("retry_after_ms", "retry_delay_ms"):
+        val = event.get(key)
+        if isinstance(val, (int, float)) and val >= 0:
+            return float(val)
+    return None
+
+
 class AnthropicCLICredentials(TypedDict):
     """OAuth credentials from the Claude CLI credentials file."""
 
@@ -538,8 +622,30 @@ class _AnthropicCLIModel:
         )
 
     def is_retryable_provider_error(self, error: Exception) -> bool:
-        """``False`` -- subprocess errors are handled via respawn, not retry."""
-        del error
+        """Session-persistent mode flags transient ``is_error`` results
+        as retryable so ``send_with_retry`` performs an in-place retry
+        (sleep → spawn fresh ``claude --print --resume`` → process only
+        the entries the per-entry-advance ``_last_sent_index`` hasn't
+        delivered yet) instead of letting the error propagate up to
+        the runtime as a ``ModelResponseError`` (which appends a
+        synthetic ``[Error: …]`` UserMessage to history and costs a
+        full turn boundary).
+
+        Stateless mode keeps the historical ``return False`` because
+        its warm ``HotSpare`` subprocess has already consumed the
+        stdin lines we wrote; same-subprocess retry would either
+        duplicate inbound messages or stall waiting on a CLI that no
+        longer expects more input. The runtime's respawn path handles
+        that case correctly by resetting ``_last_sent_index = 0`` and
+        re-feeding history from scratch.
+
+        Only :class:`AnthropicCLIRetryableError` qualifies; plain
+        :class:`SubprocessTransportError` (subprocess died, stdout
+        closed, blocking_limit context overflow) still propagates so
+        the operator sees the failure.
+        """
+        if isinstance(error, AnthropicCLIRetryableError):
+            return self._session_id is not None
         return False
 
     def usage_snapshot(self) -> UsageSnapshot | None:
@@ -861,6 +967,17 @@ class _AnthropicCLIModel:
                 usage_event = event
                 stop_reason = cast(str | None, event.get("stop_reason"))
                 if event.get("is_error"):
+                    # Classify transient shapes for in-place retry vs
+                    # fatal shapes for runtime escalation. See
+                    # :func:`_is_event_retryable` for the catalog.
+                    if _is_event_retryable(cast(dict, event)):
+                        raise AnthropicCLIRetryableError(
+                            f"AnthropicCLI: retryable result is_error: {event}",
+                            retry_after_ms=_extract_retry_after_ms(
+                                cast(dict, event),
+                            ),
+                            event=cast(dict, event),
+                        )
                     raise SubprocessTransportError(
                         f"AnthropicCLI: result is_error: {event}"
                     )

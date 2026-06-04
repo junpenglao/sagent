@@ -67,6 +67,32 @@ _DATA_DIR = _resolve_data_dir()
 _AUDIT_LOG = _DATA_DIR / "main.jsonl"
 
 
+def _sum_tokens(tc: object) -> int:
+    """Sum the 4 components of a ``TokenCount`` for a single dashboard number."""
+    if tc is None:
+        return 0
+    parts = (
+        getattr(tc, "input_tokens", 0) or 0,
+        getattr(tc, "output_tokens", 0) or 0,
+        getattr(tc, "cache_read_tokens", 0) or 0,
+        getattr(tc, "cache_creation_tokens", 0) or 0,
+    )
+    return int(sum(parts))
+
+
+def _token_breakdown(tc: object) -> dict:
+    """Per-component dict for the debug page (cache hit vs creation is the
+    interesting split when running cheap-tier models)."""
+    if tc is None:
+        return {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+    return {
+        "input": int(getattr(tc, "input_tokens", 0) or 0),
+        "output": int(getattr(tc, "output_tokens", 0) or 0),
+        "cache_read": int(getattr(tc, "cache_read_tokens", 0) or 0),
+        "cache_creation": int(getattr(tc, "cache_creation_tokens", 0) or 0),
+    }
+
+
 def _iso8601_z() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + (
         datetime.now(timezone.utc).strftime("%f")[:3] + "Z"
@@ -219,10 +245,33 @@ def make_app(agents: dict[str, object]):
                 "pending": pending,
                 "inbox_size": inbox_size,
                 "model_id": getattr(agent, "model_id", None),
+                # Cost + token reporting (parity with v2's /api/agents).
+                # Both are sagent ``Agent`` public attributes maintained
+                # by the cost tracker; ``total_cost_usd`` accumulates
+                # across the agent's lifetime (including resumed
+                # sessions thanks to CostTracker.restore_totals).
+                "total_cost_usd": float(
+                    getattr(agent, "total_cost_usd", 0.0) or 0.0,
+                ),
+                # ``Agent.total_tokens`` returns a TokenCount (immutable
+                # 4-tuple of input/output/cache_read/cache_creation).
+                # Surface both the sum (for a single dashboard number)
+                # AND the breakdown (for the debug page).
+                "total_tokens": _sum_tokens(
+                    getattr(agent, "total_tokens", None),
+                ),
+                "token_breakdown": _token_breakdown(
+                    getattr(agent, "total_tokens", None),
+                ),
             })
+        # Aggregate totals for the dashboard footer.
+        total_cost = sum(a["total_cost_usd"] for a in out)
+        total_tokens = sum(a["total_tokens"] for a in out)
         return JSONResponse({
             "now": _iso8601_z(),
             "agents": out,
+            "total_cost_usd": total_cost,
+            "total_tokens": total_tokens,
         })
 
     async def post(request: Request) -> Response:

@@ -807,6 +807,14 @@ def _build_http_app(agents):
         to = str(payload.get("to", "")).strip()
         body = str(payload.get("body", ""))
         from_role = str(payload.get("from", "user")).strip() or "user"
+        # Peer ``urgent`` flag (default False). The ``UserMessage`` path
+        # below is unaffected — operator messages always preempt by
+        # virtue of being ``UserMessage`` (the runtime never gated
+        # operator preempt on ``urgent``). Only the peer
+        # ``AgentSendMessage`` path forwards this flag, because that's
+        # where most-traffic-is-routine vs occasional-STOP is the
+        # meaningful distinction.
+        urgent = bool(payload.get("urgent", False))
         if not to or not body:
             return JSONResponse(
                 {"error": "both 'to' and 'body' are required"}, status_code=400
@@ -835,7 +843,9 @@ def _build_http_app(agents):
                 delivery.append_record(from_role=from_role, to=[to], body=body)
             if to != "user":
                 target.runtime.inbox.push_back(
-                    AgentSendMessage(source=from_role, text=body),
+                    AgentSendMessage(
+                        source=from_role, text=body, urgent=urgent,
+                    ),
                 )
         return JSONResponse({"ok": True, "to": to, "from": from_role})
 

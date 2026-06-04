@@ -7273,8 +7273,17 @@ class _CancellableBlockingModel:
 
 @pytest.mark.asyncio
 @pytest.mark.real_sleep
-async def test_preempt_in_flight_calls_cancel_on_agent_send_mid_stream() -> None:
-    """AgentSendMessage mid-stream triggers model.cancel_in_flight when opted in."""
+async def test_preempt_in_flight_calls_cancel_on_urgent_agent_send_mid_stream() -> None:
+    """``urgent=True`` AgentSendMessage mid-stream triggers
+    ``model.cancel_in_flight`` when ``preempt_in_flight=True``.
+
+    Updated 2026-06-04: prior behaviour preempted every
+    ``AgentSendMessage``; empirically ~72% of those preempts were
+    routine peer traffic (status updates, acks) that shouldn't have
+    interrupted at all. The runtime now only preempts when the
+    sender explicitly flagged the message as ``urgent`` -- reserving
+    interrupt for STOP / pivot directives and same-sender corrections.
+    """
     model = _CancellableBlockingModel()
     agent = agent_runtime.AgentRuntime(model=model, preempt_in_flight=True)
     collector = EventCollector()
@@ -7284,7 +7293,9 @@ async def test_preempt_in_flight_calls_cancel_on_agent_send_mid_stream() -> None
     async def send_correction() -> None:
         await model.started.wait()
         agent.inbox.push_back(
-            AgentSendMessage(source="tl", text="ABORT, switch direction"),
+            AgentSendMessage(
+                source="tl", text="ABORT, switch direction", urgent=True,
+            ),
         )
 
     await asyncio.gather(
@@ -7299,6 +7310,82 @@ async def test_preempt_in_flight_calls_cancel_on_agent_send_mid_stream() -> None
     sends = [m for m in agent.context().messages if isinstance(m, AgentSendMessage)]
     assert any("ABORT" in m.text for m in sends), (
         f"queued AgentSendMessage did not reach history; got {[m.text for m in sends]!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.real_sleep
+async def test_preempt_in_flight_does_not_cancel_on_routine_agent_send_mid_stream() -> None:
+    """``urgent=False`` (default) AgentSendMessage mid-stream does
+    NOT trigger cancel even with ``preempt_in_flight=True``.
+
+    Companion to the urgent-path test above. The routine peer message
+    buffers in ``_mid_stream_queue`` and drains into history at the
+    next gate firing, without interrupting the recipient's current
+    turn. Eliminates the wasted-compute cost the
+    "every-peer-message-preempts" behaviour was burning on routine
+    status updates.
+
+    The model used here completes naturally (small delay, no
+    cancellation needed) -- the goal is to demonstrate the routine
+    message DIDN'T preempt, not that it survived a preempt.
+    """
+    cancel_calls: list[float] = []
+    started = asyncio.Event()
+
+    @dataclass(kw_only=True, slots=True)
+    class _NaturalCompletionModel:
+        """Completes after a short sleep; records any cancel calls."""
+
+        async def stream(
+            self,
+            history: list[ModelContextEvent],
+            on_text: Callable[[str], None],
+            on_thinking: Callable[[str], None],
+        ) -> AssistantMessage:
+            del history, on_thinking
+            started.set()
+            # 1s window for the routine inbound to arrive + be processed
+            # by the drain loop. If preempt-on-routine fires, cancel_calls
+            # would record it (and we'd want the assertion below to
+            # catch the regression).
+            await asyncio.sleep(1.0)
+            for ch in "ok":
+                on_text(ch)
+            return AssistantMessage(text="ok")
+
+        def cancel_in_flight(self) -> bool:
+            cancel_calls.append(0.0)
+            return True
+
+    model = _NaturalCompletionModel()
+    agent = agent_runtime.AgentRuntime(model=model, preempt_in_flight=True)
+    collector = EventCollector()
+    agent.observers.append(collector)
+    agent.inbox.push_back(UserMessage(text="start"))
+
+    async def send_routine() -> None:
+        await started.wait()
+        agent.inbox.push_back(
+            AgentSendMessage(
+                source="swe", text="FYI: I committed the patch.",
+                # urgent omitted -> defaults to False
+            ),
+        )
+
+    await asyncio.gather(
+        run_with_quit(agent, timeout_sec=5.0),
+        send_routine(),
+    )
+
+    assert len(cancel_calls) == 0, (
+        f"routine (urgent=False) AgentSendMessage should NOT call "
+        f"cancel_in_flight; got {len(cancel_calls)} calls"
+    )
+    # The buffered routine message must still reach history.
+    sends = [m for m in agent.context().messages if isinstance(m, AgentSendMessage)]
+    assert any("FYI" in m.text for m in sends), (
+        f"queued routine message did not reach history; got {[m.text for m in sends]!r}"
     )
 
 

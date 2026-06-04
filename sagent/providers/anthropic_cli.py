@@ -95,6 +95,28 @@ class AnthropicCLIRetryableError(SubprocessTransportError):
     as a fatal ``ModelResponseError`` (which would burn a turn boundary
     + pollute history with a synthetic ``[Error: ...]`` UserMessage).
 
+    **Naming heritage and corrected understanding (2026-06-04 evening).**
+    The ``aborted_streaming`` / ``ede_diagnostic`` shape was originally
+    framed as "Anthropic-side stream instability under load." Live
+    cross-correlation with peer-message timestamps that evening showed
+    the dominant cause is actually our own SIGINT preempt
+    (``runtime.preempt_in_flight=True``, override #2): when a peer or
+    operator message arrives while a ``claude --print`` subprocess is
+    mid-turn, we ``model.cancel_in_flight()`` to make room for the new
+    inbound. The CLI subprocess dies and emits a final ``result`` event
+    with ``terminal_reason="aborted_streaming"`` + an ede_diagnostic
+    line -- exactly the shape we'd been attributing to upstream
+    instability. The smoking gun was the 0-input-token events: an API
+    can't abort a request that never reached it; only a local SIGINT
+    can.
+
+    So the dominant retry path here is: "operator typed a correction
+    mid-turn, our preempt killed the in-flight subprocess, retry the
+    delivery via ``--resume`` so the correction lands cleanly without
+    burning a runtime turn boundary." Genuine upstream stream cuts
+    exist but are a minority. The retry behaviour is correct either
+    way; only the framing matters for future debugging.
+
     See :func:`_is_event_retryable` for the catalog of shapes that are
     treated as transient. Carries an optional ``retry_after_ms`` hint
     extracted from the CLI event when present; ``send_with_retry`` will
@@ -116,21 +138,24 @@ class AnthropicCLIRetryableError(SubprocessTransportError):
 def _is_event_retryable(event: dict) -> bool:
     """Classify a CLI ``result`` event as transient.
 
-    Validated against ~60 organic ``is_error`` events captured on
-    2026-06-03/04 from the live multi-agent server. The retryable
-    shapes share two attributes: (a) the model session is still
-    consistent (claude wrote partial assistant content to disk before
-    the stream aborted) and (b) re-running the same request usually
-    succeeds without operator intervention.
+    Validated against ~60 ``is_error`` events captured on 2026-06-03/04
+    from the live multi-agent server. The retryable shapes share two
+    attributes: (a) claude's session JSONL on disk remains consistent
+    (the next ``--resume`` will pick up cleanly), and (b) re-running
+    the same request usually succeeds without operator intervention.
 
     Retryable shapes:
 
-    * ``terminal_reason == "aborted_streaming"``: API-side mid-stream
-      cut, often paired with ``stop_reason == "tool_use"`` and an
-      ``[ede_diagnostic]`` entry in ``errors``. Dominant pattern in
-      today's data (~80% of TL/SWE error events).
-    * ``errors`` contains an ``[ede_diagnostic]`` line: same root
-      cause, occasionally reported with ``terminal_reason == "completed"``.
+    * ``terminal_reason == "aborted_streaming"``: dominant pattern,
+      often paired with ``stop_reason == "tool_use"`` and an
+      ``[ede_diagnostic]`` entry in ``errors``. **Historically read as
+      "Anthropic-side mid-stream cut"; the dominant cause is actually
+      our own preempt SIGINT** (see :class:`AnthropicCLIRetryableError`
+      for the diagnosis). 0-input-token instances are unambiguous
+      preempt kills (the API never saw the request).
+    * ``errors`` contains an ``[ede_diagnostic]`` line: same surface
+      shape, occasionally reported with ``terminal_reason ==
+      "completed"`` when the SIGINT raced the natural stop.
 
     NOT retryable:
 
@@ -140,6 +165,11 @@ def _is_event_retryable(event: dict) -> bool:
       ``ModelResponseError`` so the operator sees ``status=hung``.
     * ``api_error_status`` in non-429 4xx: client-side issue, retry
       won't help.
+
+    The classification doesn't depend on root cause: retryable shapes
+    recover cleanly via ``--resume`` regardless of whether the abort
+    came from upstream or from our own SIGINT. Only the framing in
+    docs/logs matters for future debugging.
     """
     terminal_reason = event.get("terminal_reason")
     if terminal_reason == "aborted_streaming":
@@ -968,8 +998,14 @@ class _AnthropicCLIModel:
                 stop_reason = cast(str | None, event.get("stop_reason"))
                 if event.get("is_error"):
                     # Classify transient shapes for in-place retry vs
-                    # fatal shapes for runtime escalation. See
-                    # :func:`_is_event_retryable` for the catalog.
+                    # fatal shapes for runtime escalation. The
+                    # dominant transient shape in practice is the
+                    # ``aborted_streaming`` event the CLI emits when
+                    # we ``model.cancel_in_flight()`` to preempt a
+                    # mid-turn subprocess for an incoming peer/operator
+                    # message; the retry then re-delivers via
+                    # ``--resume``. See :func:`_is_event_retryable`
+                    # for the catalog.
                     if _is_event_retryable(cast(dict, event)):
                         raise AnthropicCLIRetryableError(
                             f"AnthropicCLI: retryable result is_error: {event}",

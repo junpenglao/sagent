@@ -67,6 +67,172 @@ _DATA_DIR = _resolve_data_dir()
 _AUDIT_LOG = _DATA_DIR / "main.jsonl"
 
 
+def _read_trace_jsonl(role_name: str) -> list[dict]:
+    """Return the per-role trace.jsonl events (one dict per line).
+
+    Used by ``/api/agents`` to enrich each agent's status with recent
+    trace tail / inflight / last_result, the way v2's debug.html
+    expects.
+    """
+    path = _DATA_DIR / "sessions" / f"{role_name}.trace.jsonl"
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def _event_summary(ev: dict) -> tuple[str, str]:
+    """Return (kind, short summary text) for one trace event."""
+    kind = ev.get("_event") or "?"
+    parts: list[str] = []
+    txt = ev.get("text")
+    if isinstance(txt, str) and txt:
+        parts.append(txt)
+    msg = ev.get("message")
+    if isinstance(msg, dict):
+        mt = msg.get("text")
+        if isinstance(mt, str) and mt:
+            parts.append(mt)
+        tcs = msg.get("tool_calls")
+        if isinstance(tcs, list):
+            for tc in tcs:
+                if isinstance(tc, dict):
+                    name = str(tc.get("name", ""))
+                    if name:
+                        parts.append(f"[{name}]")
+    label = ev.get("label")
+    if isinstance(label, str) and label:
+        parts.append(label)
+    src = ev.get("source")
+    if isinstance(src, str) and src:
+        parts.append(f"from={src}")
+    return kind, " ".join(parts).strip()
+
+
+def _diagnose_agent(label: str, agent: object) -> dict:
+    """Build the rich per-agent record the debug page expects."""
+    from datetime import datetime, timezone
+
+    rt = getattr(agent, "runtime", None)
+    in_flight_call = bool(getattr(rt, "model_call", None)) if rt else False
+    inbox = getattr(rt, "inbox", None) if rt else None
+    inbox_size = 0
+    if inbox is not None:
+        q = getattr(inbox, "_queue", None)
+        if hasattr(q, "qsize"):
+            inbox_size = q.qsize()
+
+    # Trace-based enrichment (matches v2's debug page contract).
+    events = _read_trace_jsonl(label)
+
+    # Last assistant timestamp -> age_sec.
+    age_sec: int | None = None
+    last_assistant_ts: str | None = None
+    for ev in reversed(events):
+        if ev.get("_event") != "ModelResponseComplete":
+            continue
+        last_assistant_ts = ev.get("_ts", "")
+        try:
+            dt = datetime.fromisoformat(last_assistant_ts.replace("Z", "+00:00"))
+            age_sec = int(
+                datetime.now(timezone.utc).timestamp() - dt.timestamp(),
+            )
+        except (ValueError, AttributeError):
+            pass
+        break
+
+    # In-turn detection: was there a ModelCallStarted with no matching
+    # ModelIdle/ModelResponseComplete/ModelResponseError after it?
+    started_idx = -1
+    ended_idx = -1
+    for i, ev in enumerate(events[-200:]):
+        k = ev.get("_event") or "?"
+        if k == "ModelCallStarted":
+            started_idx = i
+        elif k in ("ModelIdle", "ModelResponseComplete", "ModelResponseError"):
+            ended_idx = i
+    in_turn = started_idx > ended_idx
+
+    # Best-effort inflight tool name.
+    inflight: str | None = None
+    if in_turn:
+        for ev in reversed(events[-200:]):
+            if (ev.get("_event") or "?") == "ToolLabel":
+                inflight = str(ev.get("label") or ev.get("text") or "")
+                break
+        if inflight is None:
+            inflight = "model thinking"
+
+    # Last completed-turn result.
+    last_result: dict | None = None
+    for ev in reversed(events):
+        k = ev.get("_event") or "?"
+        if k == "ModelResponseComplete":
+            last_result = {"ok": True, "ts": ev.get("_ts", "")}
+            break
+        if k == "ModelResponseError":
+            last_result = {"ok": False, "ts": ev.get("_ts", "")}
+            break
+
+    # Recent trace tail (last 6, oldest-first so debug page can
+    # ``.reverse()`` if it wants).
+    recent: list[dict] = []
+    for ev in events[-6:]:
+        kind, summary = _event_summary(ev)
+        recent.append({
+            "ts": ev.get("_ts", ""),
+            "kind": kind,
+            "summary": summary[:200],
+        })
+
+    # Diagnosis: 1-line status string.
+    if in_turn and (age_sec is None or age_sec > 90):
+        status = "hung"
+        diagnosis = (
+            f"In a model call for {age_sec or '?'}s without a turn boundary. "
+            f"Inflight: {inflight or 'model thinking'}."
+        )
+    elif in_turn:
+        status = "working"
+        diagnosis = f"Model call in flight. Inflight: {inflight or 'model thinking'}."
+    elif inbox_size > 0:
+        status = "stuck"
+        diagnosis = f"Idle with {inbox_size} unanswered inbox item(s)."
+    else:
+        status = "idle"
+        diagnosis = "Last turn complete, inbox empty — waiting for work."
+
+    return {
+        "role": label,
+        "status": status,
+        "diagnosis": diagnosis,
+        "in_turn": in_turn,
+        "inflight": inflight,
+        "pending": inbox_size,
+        "inbox_size": inbox_size,
+        "pending_preview": [],  # debug page tolerates empty list
+        "age_sec": age_sec,
+        "last_result": last_result,
+        "last_ts": last_assistant_ts,
+        "recent": recent,
+        "model_id": getattr(agent, "model_id", None),
+        "total_cost_usd": float(getattr(agent, "total_cost_usd", 0.0) or 0.0),
+        "total_tokens": _sum_tokens(getattr(agent, "total_tokens", None)),
+        "token_breakdown": _token_breakdown(
+            getattr(agent, "total_tokens", None),
+        ),
+    }
+
+
 def _sum_tokens(tc: object) -> int:
     """Sum the 4 components of a ``TokenCount`` for a single dashboard number."""
     if tc is None:
@@ -224,47 +390,16 @@ def make_app(agents: dict[str, object]):
         return FileResponse(_PLUGIN_ROOT / "web" / "debug.html")
 
     async def get_agents(request: Request) -> Response:
+        """Per-agent rich status (used by both web UI and /debug page).
+
+        Returns the v2-shape ``recent``/``inflight``/``last_result``/
+        ``age_sec``/``diagnosis`` fields that debug.html expects.
+        Without these, the debug page renders "no trace events" for
+        every agent.
+        """
         del request
-        out = []
-        for label, agent in agents.items():
-            rt = getattr(agent, "runtime", None)
-            in_turn = bool(getattr(rt, "model_call", None))
-            pending = len(getattr(rt, "_mid_stream_queue", []) or [])
-            inbox = getattr(rt, "inbox", None)
-            inbox_size = 0
-            if inbox is not None:
-                # ``inbox._queue`` is an ``asyncio.Queue`` — use ``qsize()``;
-                # ``len()`` doesn't work on it.
-                q = getattr(inbox, "_queue", None)
-                if hasattr(q, "qsize"):
-                    inbox_size = q.qsize()
-            out.append({
-                "role": label,
-                "status": "working" if in_turn else "idle",
-                "in_turn": in_turn,
-                "pending": pending,
-                "inbox_size": inbox_size,
-                "model_id": getattr(agent, "model_id", None),
-                # Cost + token reporting (parity with v2's /api/agents).
-                # Both are sagent ``Agent`` public attributes maintained
-                # by the cost tracker; ``total_cost_usd`` accumulates
-                # across the agent's lifetime (including resumed
-                # sessions thanks to CostTracker.restore_totals).
-                "total_cost_usd": float(
-                    getattr(agent, "total_cost_usd", 0.0) or 0.0,
-                ),
-                # ``Agent.total_tokens`` returns a TokenCount (immutable
-                # 4-tuple of input/output/cache_read/cache_creation).
-                # Surface both the sum (for a single dashboard number)
-                # AND the breakdown (for the debug page).
-                "total_tokens": _sum_tokens(
-                    getattr(agent, "total_tokens", None),
-                ),
-                "token_breakdown": _token_breakdown(
-                    getattr(agent, "total_tokens", None),
-                ),
-            })
-        # Aggregate totals for the dashboard footer.
+        out = [_diagnose_agent(label, agent) for label, agent in agents.items()]
+        out.sort(key=lambda d: d["role"])
         total_cost = sum(a["total_cost_usd"] for a in out)
         total_tokens = sum(a["total_tokens"] for a in out)
         return JSONResponse({
@@ -379,8 +514,29 @@ def make_app(agents: dict[str, object]):
                 except json.JSONDecodeError:
                     continue
         total_on_disk = len(events)
+        qp = request.query_params
+        # ``?around=N&ctx=K`` — return a K-event window on each side of
+        # event index N. Used by the /debug page to show context around
+        # search hits.
+        if "around" in qp:
+            try:
+                around = int(qp["around"])
+            except ValueError:
+                around = total_on_disk - 1
+            try:
+                ctx = max(0, min(200, int(qp.get("ctx", "14"))))
+            except ValueError:
+                ctx = 14
+            start = max(0, around - ctx)
+            end = min(total_on_disk, around + ctx + 1)
+            return JSONResponse({
+                "events": events[start:end],
+                "offset": start,
+                "total": total_on_disk,
+                "hit": around,
+            })
         try:
-            limit = max(1, min(20000, int(request.query_params.get("limit", "2000"))))
+            limit = max(1, min(20000, int(qp.get("limit", "2000"))))
         except ValueError:
             limit = 2000
         sliced = events[-limit:] if total_on_disk > limit else events
@@ -388,6 +544,85 @@ def make_app(agents: dict[str, object]):
             "events": sliced,
             "total": total_on_disk,
             "returned": len(sliced),
+        })
+
+    async def search(request: Request) -> Response:
+        """Full-text search across audit log + per-role traces.
+
+        Used by /debug. Body shape (mirrors v2):
+            ``?q=<text>&scope=traces|messages|all&limit=N``
+        """
+        import glob
+
+        qp = request.query_params
+        q = (qp.get("q") or "").strip().lower()
+        scope = qp.get("scope", "all").lower()
+        try:
+            limit = max(1, min(2000, int(qp.get("limit", "300"))))
+        except ValueError:
+            limit = 300
+        if not q:
+            return JSONResponse({"results": [], "total": 0, "q": ""})
+        results: list[dict] = []
+
+        if scope in ("messages", "all"):
+            if _AUDIT_LOG.exists():
+                with _AUDIT_LOG.open(encoding="utf-8") as f:
+                    for i, line in enumerate(f):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            r = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        haystack = (r.get("body") or "") + " " + " ".join(
+                            r.get("to") or []
+                        ) + " " + (r.get("from") or "")
+                        if q in haystack.lower():
+                            results.append({
+                                "source": "messages",
+                                "idx": i,
+                                "ts": r.get("ts", ""),
+                                "from": r.get("from", "?"),
+                                "to": r.get("to") or [],
+                                "snippet": (r.get("body") or "")[:200],
+                            })
+                            if len(results) >= limit:
+                                break
+        if scope in ("traces", "all"):
+            for path in sorted(
+                glob.glob(str(_DATA_DIR / "sessions" / "*.trace.jsonl")),
+            ):
+                role = Path(path).stem.replace(".trace", "")
+                with open(path, encoding="utf-8") as f:
+                    for i, line in enumerate(f):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        _, summary = _event_summary(ev)
+                        if q in summary.lower() or q in (ev.get("_event") or "").lower():
+                            results.append({
+                                "source": "trace",
+                                "role": role,
+                                "idx": i,
+                                "ts": ev.get("_ts", ""),
+                                "kind": ev.get("_event", "?"),
+                                "snippet": summary[:200],
+                            })
+                            if len(results) >= limit:
+                                break
+                if len(results) >= limit:
+                    break
+
+        return JSONResponse({
+            "results": results,
+            "total": len(results),
+            "q": q,
         })
 
     async def restart(request: Request) -> Response:
@@ -419,6 +654,7 @@ def make_app(agents: dict[str, object]):
         Route("/api/members", get_members),
         Route("/api/roles", get_members),
         Route("/api/trace/{role}", get_trace),
+        Route("/api/search", search),
         Route("/api/restart", restart, methods=["POST"]),
     ]
     return Starlette(routes=routes)

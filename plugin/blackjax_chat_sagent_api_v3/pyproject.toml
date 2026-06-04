@@ -1,0 +1,22 @@
+[project]
+name = "blackjax-chat-sagent-api-v3"
+version = "0.0.1"
+description = "Direct-API variant of the BlackJAX sagent chat plugin (no CLI subprocess); the v2 README's speculative third column, now actually built."
+requires-python = ">=3.12"
+dependencies = [
+    "sagent",
+]
+
+[tool.uv.sources]
+sagent = { git = "https://github.com/junpenglao/sagent.git", branch = "feat/cli-session-resume" }
+
+# When the upstream PR at rekursiv-ai/sagent merges, switch to:
+#   sagent = ">=<NEXT_RELEASE_VERSION>"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["roles*", "runtime*", "tests*"]

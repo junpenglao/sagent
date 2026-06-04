@@ -543,6 +543,110 @@ async def test_session_persistent_advances_sent_index_per_entry_on_partial_failu
     assert model._last_sent_index == 7
 
 
+def test_is_event_retryable_classifies_organic_shapes() -> None:
+    """Direct unit test of the catalog. Examples are taken from
+    actual ``is_error: True`` events captured 2026-06-03/04 from the
+    multi-agent server.
+    """
+    from sagent.providers.anthropic_cli import _is_event_retryable
+
+    # 1. The dominant aborted_streaming + ede_diagnostic shape (TL,
+    #    2026-06-03 10:17:53 — 418k cache reads attempt that died on
+    #    a tool_use boundary). Retryable.
+    aborted_streaming = {
+        "type": "result", "subtype": "error_during_execution",
+        "is_error": True, "stop_reason": "tool_use",
+        "terminal_reason": "aborted_streaming",
+        "errors": [
+            "[ede_diagnostic] result_type=user last_content_type=n/a "
+            "stop_reason=tool_use",
+        ],
+    }
+    assert _is_event_retryable(aborted_streaming) is True
+
+    # 2. ede_diagnostic without aborted_streaming terminal_reason --
+    #    still retryable (same root cause, different surface).
+    ede_only = {
+        "is_error": True,
+        "terminal_reason": "completed",
+        "errors": ["[ede_diagnostic] mid-stream cut"],
+    }
+    assert _is_event_retryable(ede_only) is True
+
+    # 3. Context overflow -- NOT retryable. The next attempt would hit
+    #    the same wall; operator must clear the session.
+    blocking_limit = {
+        "is_error": True,
+        "terminal_reason": "blocking_limit",
+        "result": "Prompt is too long",
+        "stop_reason": "stop_sequence",
+    }
+    assert _is_event_retryable(blocking_limit) is False
+
+    # 4. Empty errors list, no special terminal_reason -- not retryable
+    #    by default.
+    unknown_error = {"is_error": True, "errors": [], "stop_reason": "end_turn"}
+    assert _is_event_retryable(unknown_error) is False
+
+
+def test_extract_retry_after_ms_handles_both_key_names() -> None:
+    """``send_with_retry`` falls back to exponential backoff when no
+    hint is present, so ``None`` is a valid return; but when the CLI
+    emits a hint (either ``retry_after_ms`` or ``retry_delay_ms``) we
+    forward it.
+    """
+    from sagent.providers.anthropic_cli import _extract_retry_after_ms
+
+    assert _extract_retry_after_ms({"retry_after_ms": 506}) == 506.0
+    assert _extract_retry_after_ms({"retry_delay_ms": 1247.5}) == 1247.5
+    assert _extract_retry_after_ms({}) is None
+    # Negative or non-numeric values are ignored (defensive).
+    assert _extract_retry_after_ms({"retry_after_ms": -1}) is None
+    assert _extract_retry_after_ms({"retry_after_ms": "soon"}) is None
+
+
+def test_is_retryable_provider_error_session_persistent_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``send_with_retry`` consults this method to decide whether to
+    sleep + retry vs let the runtime see the error. Session-persistent
+    mode answers True for :class:`AnthropicCLIRetryableError`;
+    stateless mode keeps the historical False (its HotSpare
+    subprocess has already consumed the stdin lines we wrote, so a
+    same-call retry would duplicate or stall).
+    """
+    from sagent.providers.anthropic_cli import AnthropicCLIRetryableError
+
+    _write_creds(tmp_path)
+    monkeypatch.setattr(
+        "sagent.providers.anthropic_cli._CREDS_PATH",
+        tmp_path / ".credentials.json",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    provider = AnthropicCLI.from_credentials()
+
+    # Stateless mode (no session_id) -- never retry at this layer.
+    stateless = provider.model("claude-haiku-4-5")
+    retryable_exc = AnthropicCLIRetryableError("aborted_streaming")
+    assert stateless.is_retryable_provider_error(retryable_exc) is False
+
+    # Session-persistent mode (session_id set) -- retry the retryable type.
+    persistent = provider.model(
+        "claude-haiku-4-5",
+        session_id="deadbeef-1234-5678-9abc-deadbeef1234",
+    )
+    assert persistent.is_retryable_provider_error(retryable_exc) is True
+
+    # Both modes still propagate non-retryable subprocess errors:
+    plain_exc = SubprocessTransportError("subprocess stdout closed before result")
+    assert stateless.is_retryable_provider_error(plain_exc) is False
+    assert persistent.is_retryable_provider_error(plain_exc) is False
+
+    # Random Exception that isn't a subprocess error: never retried.
+    assert persistent.is_retryable_provider_error(RuntimeError("oops")) is False
+
+
 def test_model_session_initialized_probes_disk_at_construction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

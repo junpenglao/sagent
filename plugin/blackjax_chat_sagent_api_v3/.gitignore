@@ -1,0 +1,22 @@
+# Runtime artifacts — produced by serve.py when SAGENT_DATA_DIR is
+# unset (the data dir defaults to the plugin source tree in that
+# case). These are never source of truth.
+main.jsonl
+sessions/
+
+# Sagent's per-role session.jsonl machinery now lives at
+# ``sessions/<role>/session.jsonl`` — the directory ignore above
+# covers it, but listing the file pattern explicitly here for
+# clarity / forward compatibility if the layout changes.
+sessions/**/session.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# uv / venv
+.venv/
+
+# Package build
+*.egg-info/

@@ -108,7 +108,26 @@ _PROVIDER = os.environ.get("SAGENT_API_PROVIDER", "google").lower()
 #   gemini-3.1-pro-preview: $2.00 in / $12.0 out / $0.20 cache
 _PROVIDER_MODELS: dict[str, dict[str, str]] = {
     "google": {
-        "tl": "gemini-3.1-pro-preview",
+        # 19:14-19:16 UTC: tried TL on gemini-3.1-pro-preview. First
+        # turn (text-only "ok") + first tool call (Bash sed) both
+        # succeeded, but the THIRD model call (continuation after
+        # tool result) failed with Google API 400:
+        #
+        #   "Function call is missing a thought_signature in
+        #    functionCall parts. This is required for tools to work
+        #    correctly, and missing it causes the model to behave
+        #    erratically."
+        #
+        # The 3.1 preview API requires a ``thought_signature`` field
+        # in function_call parts when continuing a tool-use
+        # conversation. sagent's Google provider
+        # (sagent/providers/google.py) doesn't include that field
+        # yet, so 3.1-pro-preview is unusable in any agent that
+        # makes tool calls. Rolled TL back to gemini-2.5-pro.
+        #
+        # TODO: file an issue against sagent to add
+        # thought_signature support, then revisit 3.1-pro-preview.
+        "tl": "gemini-2.5-pro",
         "swe": "gemini-2.5-pro",
         "statistician": "gemini-2.5-pro",
         "_default": "gemini-2.5-flash",  # junior-swe, tech-writer

@@ -274,6 +274,65 @@ def _model_spec_for(model_id: str):
     )
 
 
+def _session_dir_for(role_name: str) -> Path | None:
+    """Per-role session directory under ``$SAGENT_DATA_DIR/sessions/<role>/``.
+
+    When ``SAGENT_DATA_DIR`` is set, returns a stable path so each
+    server restart finds the same directory and ``load_session()``
+    can replay the prior tape. When the env var is unset, returns
+    None so persistence is disabled (matches v1/v2 stateless behaviour
+    for casual local runs without a data dir).
+    """
+    base = os.environ.get("SAGENT_DATA_DIR")
+    if not base:
+        return None
+    session_dir = Path(base).expanduser().resolve() / "sessions" / role_name
+    session_dir.mkdir(parents=True, exist_ok=True)
+    return session_dir
+
+
+def _resume_if_persisted(agent: object, session_dir: Path | None) -> None:
+    """If ``session.jsonl`` exists in ``session_dir``, replay its tape.
+
+    Mirrors the v2 ``--resume <uuid>`` promise but at the sagent layer
+    instead of the claude-CLI layer. ``load_session`` returns None
+    when no persisted state exists (first boot), in which case the
+    agent starts with empty history.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    if session_dir is None:
+        return
+    try:
+        from sagent.agent.session_io import load_session
+    except ImportError as exc:
+        log.warning("session_io.load_session not available: %s", exc)
+        return
+    try:
+        loaded = load_session(session_dir, {})
+    except Exception as exc:  # noqa: BLE001 -- log + continue with empty tape
+        log.warning(
+            "load_session(%s) failed: %s — starting with empty tape",
+            session_dir, exc,
+        )
+        return
+    if loaded is None:
+        # First boot for this role — no persisted session yet.
+        return
+    try:
+        agent.resume(*loaded)
+        log.info(
+            "resumed agent %r from %s",
+            getattr(agent, "name", "?"), session_dir,
+        )
+    except Exception:  # noqa: BLE001 -- log + continue with empty tape
+        log.exception(
+            "resume() failed for %r; continuing with empty tape",
+            getattr(agent, "name", "?"),
+        )
+
+
 def build_agent(
     *,
     role_name: str,
@@ -304,12 +363,14 @@ def build_agent(
     from sagent.agent import Agent
 
     provider = build_provider()
+    session_dir = _session_dir_for(role_name)
     agent = Agent(
         model=provider.model(model_id),
         model_spec=_model_spec_for(model_id),
         system=load_system_prompt(role_md_path),
         tools=list(tools),
         name=role_name,
+        session_dir=session_dir,
         max_tool_call_rounds=max_tool_call_rounds,
         max_budget_usd=max_budget_usd,
         # Same runtime-level overrides as v2 — these are provider-
@@ -318,6 +379,7 @@ def build_agent(
         preempt_in_flight=True,
         coalesce_inbox=False,
     )
+    _resume_if_persisted(agent, session_dir)
     # Mark the agent as persistent so ``_install_contextvars``
     # (called by ``serve_forever``) registers it under its canonical
     # name (``tl``, ``swe``, …) rather than the auto-disambiguated

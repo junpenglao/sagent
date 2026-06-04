@@ -205,9 +205,13 @@ def make_app(agents: dict[str, object]):
             in_turn = bool(getattr(rt, "model_call", None))
             pending = len(getattr(rt, "_mid_stream_queue", []) or [])
             inbox = getattr(rt, "inbox", None)
-            inbox_size = (
-                len(getattr(inbox, "_queue", [])) if inbox is not None else 0
-            )
+            inbox_size = 0
+            if inbox is not None:
+                # ``inbox._queue`` is an ``asyncio.Queue`` — use ``qsize()``;
+                # ``len()`` doesn't work on it.
+                q = getattr(inbox, "_queue", None)
+                if hasattr(q, "qsize"):
+                    inbox_size = q.qsize()
             out.append({
                 "role": label,
                 "status": "working" if in_turn else "idle",

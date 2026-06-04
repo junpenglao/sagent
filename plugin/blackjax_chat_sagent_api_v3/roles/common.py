@@ -304,7 +304,7 @@ def build_agent(
     from sagent.agent import Agent
 
     provider = build_provider()
-    return Agent(
+    agent = Agent(
         model=provider.model(model_id),
         model_spec=_model_spec_for(model_id),
         system=load_system_prompt(role_md_path),
@@ -318,3 +318,18 @@ def build_agent(
         preempt_in_flight=True,
         coalesce_inbox=False,
     )
+    # Mark the agent as persistent so ``_install_contextvars``
+    # (called by ``serve_forever``) registers it under its canonical
+    # name (``tl``, ``swe``, …) rather than the auto-disambiguated
+    # ``tl_1`` / ``swe_1`` that ``unique_registry_label`` produces
+    # for transient agents. Persistent means "long-lived agent with
+    # a stable identity" — semantically correct for a chat-channel
+    # role that runs for the lifetime of serve.py.
+    #
+    # Without this, the first probe (2026-06-04) showed peer messages
+    # from TL arriving at SWE with ``source='tl_1'`` — bootstrap had
+    # pre-registered ``tl`` in ``agent_registry``, so serve_forever
+    # auto-suffixed when it registered itself. With it, peers see
+    # ``source='tl'`` and ``AgentSend(to='tl', ...)`` resolves cleanly.
+    agent._persistent = True  # noqa: SLF001 -- sagent flag, not a constructor arg
+    return agent

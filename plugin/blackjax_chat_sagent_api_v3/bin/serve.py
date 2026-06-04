@@ -86,15 +86,16 @@ def _audit_append(record: dict) -> None:
 
 
 def build_agents() -> dict[str, object]:
-    """Instantiate the five role agents and register them.
+    """Instantiate the five role agents.
 
-    Returns a ``{label: Agent}`` mapping; also registers each agent
-    in sagent's global ``agent_registry`` so cross-agent
-    ``AgentSend(to=...)`` calls can resolve targets.
+    Returns a ``{label: Agent}`` mapping. Does NOT pre-populate
+    ``agent_registry`` — that happens automatically when
+    ``serve_forever()`` runs ``_install_contextvars`` on each agent,
+    which uses the canonical name since ``build_agent`` set
+    ``agent._persistent = True`` (see common.py rationale).
     """
     from roles import junior_swe, statistician, swe, tech_writer, tl
-    from runtime import trace_writer
-    from sagent.tools.core import agent_registry
+    from runtime import audit_writer, trace_writer
 
     builders = {
         "tl": tl.build,
@@ -107,8 +108,14 @@ def build_agents() -> dict[str, object]:
     for label, builder in builders.items():
         agent = builder()
         agents[label] = agent
-        agent_registry[label] = agent
         trace_writer.install_on(agent, label)
+        # Audit-log writer: emits one main.jsonl record per outbound
+        # AgentSend so the web UI sees peer traffic. The /api/post
+        # handler emits its own records for operator-side ingress;
+        # this observer covers the peer-to-peer side that bypasses
+        # /api/post entirely in v3 (sagent's AgentSend pushes to the
+        # recipient inbox directly).
+        audit_writer.install_on(agent, label, audit_log_path=_AUDIT_LOG)
     return agents
 
 
@@ -350,10 +357,15 @@ def make_app(agents: dict[str, object]):
 
 
 async def _run_agents(agents: dict[str, object]) -> list[asyncio.Task]:
-    """Spawn each agent's runtime loop as a background asyncio task."""
+    """Spawn each agent's loop as a background asyncio task.
+
+    ``Agent.serve_forever()`` is the daemon entrypoint that drains
+    the inbox + drives model_calls; ``runtime.run(msg)`` is the
+    single-turn primitive and would crash here without an arg.
+    """
     tasks: list[asyncio.Task] = []
     for label, agent in agents.items():
-        task = asyncio.create_task(agent.runtime.run(), name=f"runtime-{label}")
+        task = asyncio.create_task(agent.serve_forever(), name=f"runtime-{label}")
         tasks.append(task)
     return tasks
 

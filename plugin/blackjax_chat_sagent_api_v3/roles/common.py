@@ -81,15 +81,19 @@ _PROVIDER = os.environ.get("SAGENT_API_PROVIDER", "google").lower()
 _PROVIDER_MODELS: dict[str, tuple[str, str]] = {
     # provider -> (tl_model, default_model)
     "google": (
-        # NOTE 2026-06-04: ``gemini-1.5-flash`` (the absolute cheapest
-        # tier at $0.075 / Mtok in) is gone from the live API — calls
-        # return 404. Sagent's KNOWN_MODELS catalog still lists it
-        # but Google has retired the public endpoint. So we step up
-        # one tier each side:
-        #   TL: gemini-2.5-flash ($0.30 / Mtok in — 2nd cheapest now)
-        #   default: gemini-2.5-flash-lite ($0.10 / Mtok in — cheapest
-        #            currently available + verified live)
-        "gemini-2.5-flash",       # TL
+        # NOTE 2026-06-04: ``gemini-1.5-flash`` (the cheapest at
+        # $0.075/Mtok) is gone from the live API; the cheapest
+        # live tier is now gemini-2.5-flash-lite at $0.10/Mtok.
+        #
+        # TL initially on gemini-2.5-flash but the live probe at
+        # 15:42-15:46 UTC showed flash returns ``text='' tool_calls=[]``
+        # on natural-language coordination prompts. gemini-2.5-pro
+        # passes the same prompt cleanly (full dispatch chain).
+        # Upgraded TL to pro for the operator's live test —
+        # see V3_FIRST_LOAD_FINDINGS.md for the comparison evidence.
+        # Cost: $1.25 input / $10.0 output per Mtok (vs flash's
+        # $0.30/$2.50). Other 4 agents stay on flash-lite.
+        "gemini-2.5-pro",         # TL
         "gemini-2.5-flash-lite",  # default
     ),
     "anthropic": (

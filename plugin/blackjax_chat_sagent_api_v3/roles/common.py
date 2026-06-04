@@ -76,39 +76,48 @@ from typing import Sequence
 _PROVIDER = os.environ.get("SAGENT_API_PROVIDER", "google").lower()
 
 
-# Model assignments per provider — cheap tier for non-TL agents,
-# second-cheapest for TL. Edit these to tune the experiment.
-_PROVIDER_MODELS: dict[str, tuple[str, str]] = {
-    # provider -> (tl_model, default_model)
-    "google": (
-        # NOTE 2026-06-04: ``gemini-1.5-flash`` (the cheapest at
-        # $0.075/Mtok) is gone from the live API; the cheapest
-        # live tier is now gemini-2.5-flash-lite at $0.10/Mtok.
-        #
-        # 17:17 boot: TL initially on gemini-2.5-flash but failed
-        # natural-language coordination (text='' tool_calls=[]).
-        # Upgraded TL to gemini-2.5-pro — passes cleanly.
-        #
-        # 17:49 UTC: junior-swe (flash-lite) wrote @tl as PROSE
-        # instead of calling AgentSend — peer never got the
-        # question. Same v1/v2 "uses @mention prose instead of
-        # the structured tool" pathology. Upgraded default tier
-        # to gemini-2.5-flash ($0.30/Mtok in vs flash-lite's
-        # $0.10) so non-TL peers can route reliably. Cost delta
-        # negligible (the four cheap agents had spent <$0.02
-        # combined at the time of the upgrade).
-        #
-        # See V3_FIRST_LOAD_FINDINGS.md for full evidence.
-        "gemini-2.5-pro",      # TL — coordination + routing
-        "gemini-2.5-flash",    # default — peer-routing reliable
-    ),
-    "anthropic": (
-        # 2nd-cheapest + cheapest in Anthropic's catalog. Adjust if
-        # the pricing/availability changes. Sagent's KNOWN_MODELS in
-        # ``providers/anthropic.py`` is the authoritative reference.
-        "claude-haiku-4-5",        # TL: same tier as default for now
-        "claude-haiku-4-5",        # default: cheapest available
-    ),
+# Model assignments per provider. Structure:
+#   provider -> {role_name: model_id, "_default": model_id}
+# Roles not explicitly listed fall through to the "_default" entry.
+#
+# Iteration history (live tested 2026-06-04):
+#
+#   17:17 — TL=flash → empty natural-language coordination response.
+#           Upgraded TL=gemini-2.5-pro. ✓
+#   17:49 — junior-swe=flash-lite wrote @tl as PROSE. Upgraded
+#           non-TL default to gemini-2.5-flash. ✓
+#   19:10 — TL on 2.5-pro reversed its own correct diagnosis when
+#           prompted to "double-check". SWE on flash persistently
+#           edited the wrong file (tripwire tests) even after TL's
+#           explicit instruction. Upgraded:
+#             - TL → gemini-3.1-pro-preview (preview tier; better
+#               at holding a hypothesis under doubt-pressure)
+#             - SWE → gemini-2.5-pro (capability for the wrapper-
+#               vs-test discrimination)
+#             - statistician → gemini-2.5-pro (similar reasoning
+#               demands; pre-emptive since she hasn't been engaged
+#               yet at depth)
+#             - junior-swe stays on flash (her work is simpler
+#               edits + tests; flash is adequate)
+#             - tech-writer stays on flash (doc QA; flash adequate)
+#
+# Pricing reference (2026-06-04 Google catalog):
+#   gemini-2.5-flash-lite: $0.10 in / $0.40 out / $0.025 cache
+#   gemini-2.5-flash:      $0.30 in / $2.50 out / $0.075 cache
+#   gemini-2.5-pro:        $1.25 in / $10.0 out / $0.31 cache
+#   gemini-3.1-pro-preview: $2.00 in / $12.0 out / $0.20 cache
+_PROVIDER_MODELS: dict[str, dict[str, str]] = {
+    "google": {
+        "tl": "gemini-3.1-pro-preview",
+        "swe": "gemini-2.5-pro",
+        "statistician": "gemini-2.5-pro",
+        "_default": "gemini-2.5-flash",  # junior-swe, tech-writer
+    },
+    "anthropic": {
+        # Anthropic catalog assignments — adjust per
+        # providers/anthropic.py KNOWN_MODELS pricing.
+        "_default": "claude-haiku-4-5",
+    },
 }
 
 if _PROVIDER not in _PROVIDER_MODELS:
@@ -117,7 +126,23 @@ if _PROVIDER not in _PROVIDER_MODELS:
         f"Supported: {sorted(_PROVIDER_MODELS)}.",
     )
 
-MODEL_TL, MODEL_DEFAULT = _PROVIDER_MODELS[_PROVIDER]
+_ROLE_MODELS = _PROVIDER_MODELS[_PROVIDER]
+MODEL_DEFAULT = _ROLE_MODELS["_default"]
+
+
+def model_for_role(role_name: str) -> str:
+    """Return the model_id assigned to ``role_name`` for the active provider.
+
+    Falls back to ``MODEL_DEFAULT`` when no explicit override is
+    configured (``junior-swe``, ``tech-writer``).
+    """
+    return _ROLE_MODELS.get(role_name, MODEL_DEFAULT)
+
+
+# Back-compat alias retained for ``roles/tl.py`` (the only file that
+# imported ``MODEL_TL`` directly). New role files should call
+# ``model_for_role(role_name)`` instead.
+MODEL_TL = model_for_role("tl")
 
 
 HEAVY_BG_REMINDER = """\

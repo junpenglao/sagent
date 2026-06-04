@@ -85,16 +85,22 @@ _PROVIDER_MODELS: dict[str, tuple[str, str]] = {
         # $0.075/Mtok) is gone from the live API; the cheapest
         # live tier is now gemini-2.5-flash-lite at $0.10/Mtok.
         #
-        # TL initially on gemini-2.5-flash but the live probe at
-        # 15:42-15:46 UTC showed flash returns ``text='' tool_calls=[]``
-        # on natural-language coordination prompts. gemini-2.5-pro
-        # passes the same prompt cleanly (full dispatch chain).
-        # Upgraded TL to pro for the operator's live test —
-        # see V3_FIRST_LOAD_FINDINGS.md for the comparison evidence.
-        # Cost: $1.25 input / $10.0 output per Mtok (vs flash's
-        # $0.30/$2.50). Other 4 agents stay on flash-lite.
-        "gemini-2.5-pro",         # TL
-        "gemini-2.5-flash-lite",  # default
+        # 17:17 boot: TL initially on gemini-2.5-flash but failed
+        # natural-language coordination (text='' tool_calls=[]).
+        # Upgraded TL to gemini-2.5-pro — passes cleanly.
+        #
+        # 17:49 UTC: junior-swe (flash-lite) wrote @tl as PROSE
+        # instead of calling AgentSend — peer never got the
+        # question. Same v1/v2 "uses @mention prose instead of
+        # the structured tool" pathology. Upgraded default tier
+        # to gemini-2.5-flash ($0.30/Mtok in vs flash-lite's
+        # $0.10) so non-TL peers can route reliably. Cost delta
+        # negligible (the four cheap agents had spent <$0.02
+        # combined at the time of the upgrade).
+        #
+        # See V3_FIRST_LOAD_FINDINGS.md for full evidence.
+        "gemini-2.5-pro",      # TL — coordination + routing
+        "gemini-2.5-flash",    # default — peer-routing reliable
     ),
     "anthropic": (
         # 2nd-cheapest + cheapest in Anthropic's catalog. Adjust if

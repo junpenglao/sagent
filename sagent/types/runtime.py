@@ -204,6 +204,21 @@ class AgentSendMessage(SessionMessage):
     attachments: tuple[BytesMessage, ...] = ()
     """Image/PDF payloads sent alongside the text."""
 
+    urgent: bool = False
+    """If True, preempt the recipient's in-flight ``model_call`` (when
+    the runtime is configured with ``preempt_in_flight=True``).
+    Default False: routine peer traffic (status updates, acks, FYIs)
+    queues until the recipient's current turn finishes naturally,
+    avoiding the wasted-compute cost of interrupting them.
+
+    Reserved for messages that must be seen before the recipient
+    takes any further action: STOP / pivot / scope-change directives
+    from a coordinator, or a same-sender correction superseding a
+    previous message before the recipient acts on the stale version.
+    Authority-wise, typical urgent senders are the coordinator (TL)
+    and any peer correcting their own prior message; routine
+    cross-peer traffic should stay non-urgent."""
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AssistantMessage(SessionMessage):

@@ -2071,7 +2071,21 @@ class AgentRuntime:
                                 # No-op for providers without
                                 # ``cancel_in_flight`` or when the runtime
                                 # was not opted into preempt-in-flight.
-                                if self._preempt_in_flight:
+                                #
+                                # Peer messages preempt only when the
+                                # sender flagged the message as ``urgent``
+                                # (default False). Routine peer traffic
+                                # (acks, status updates, FYIs) queues
+                                # cleanly without interrupting the
+                                # recipient's current turn; only genuine
+                                # interrupt-class messages (TL STOPs,
+                                # pivot directives) pay the preempt cost.
+                                # Empirically 2026-06-04: ~72% of TL's
+                                # preempts were routine peer messages
+                                # that shouldn't have interrupted at
+                                # all -- this gate eliminates that
+                                # wasted compute.
+                                if self._preempt_in_flight and item.urgent:
                                     cancel = getattr(
                                         self.model, "cancel_in_flight", None,
                                     )

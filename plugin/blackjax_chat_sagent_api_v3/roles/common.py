@@ -175,12 +175,18 @@ The structured tool call IS the only routing.
 **This applies to the user too.** To reply to the user, call \
 `AgentSend(to="user", content=...)` — your assistant text is NOT \
 shown in their chat UI. The user only sees explicit AgentSend \
-calls. If you finish a tool sequence and want to confirm \
-completion to the user, call `AgentSend(to="user", ...)` once \
-with the result; do NOT write a narrative summary of "here's what \
-I just did" in your text content blocks — it will not be \
-delivered. Silence is honest feedback that you didn't intend to \
-message anyone this turn.
+calls.
+
+**Operator Visibility:** The operator (@user) has FULL visibility \
+into all live peer-to-peer traffic via the audit log. Do NOT \
+forward or quote full peer messages when reporting to the user. \
+Provide only terse high-level summaries of peer progress. If you \
+finish a tool sequence and want to confirm completion to the \
+user, call `AgentSend(to="user", ...)` once with the result; \
+do NOT write a narrative summary of "here's what I just did" \
+in your text content blocks — it will not be delivered. \
+Silence is honest feedback that you didn't intend to message \
+anyone this turn.
 
 **Common failure mode (do not do this):** writing text like \
 "I'll send the summary to @user" or "Let me send a message to @swe" \

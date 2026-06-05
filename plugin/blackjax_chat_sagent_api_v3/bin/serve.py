@@ -410,45 +410,50 @@ def make_app(agents: dict[str, object]):
         })
 
     async def post(request: Request) -> Response:
-        """Operator + peer ingress. Body: ``{to, body, from?, urgent?}``."""
+        """Operator + peer ingress. Body: ``{to: str|list, body, from?, urgent?}``."""
         payload = await request.json()
-        to = str(payload.get("to", "")).strip()
+        to_raw = payload.get("to", "")
+        recipients = [to_raw] if isinstance(to_raw, str) else list(to_raw)
+        recipients = [r.strip() for r in recipients if r and isinstance(r, str)]
         body = str(payload.get("body", ""))
         from_role = str(payload.get("from", "user")).strip() or "user"
         urgent = bool(payload.get("urgent", False))
-        if not to or not body:
+
+        if not recipients or not body:
             return JSONResponse(
                 {"error": "both 'to' and 'body' are required"},
                 status_code=400,
             )
-        target = agent_registry.get(to)
-        if target is None and to != "user":
-            return JSONResponse(
-                {
-                    "error": f"unknown target {to!r}; active: {sorted(agents)}",
-                },
-                status_code=404,
-            )
+
+        # Validate all targets first
+        from sagent.tools.core import agent_registry
+        for to in recipients:
+            if to != "user" and agent_registry.get(to) is None:
+                return JSONResponse(
+                    {"error": f"unknown target {to!r}; active: {sorted(agents)}"},
+                    status_code=404,
+                )
 
         _audit_append({
             "ts": _iso8601_z(),
             "from": from_role,
-            "to": [to],
+            "to": recipients,
             "body": body,
             **({"urgent": True} if urgent else {}),
         })
 
-        if to == "user":
-            # User-as-recipient: audit only; no inbox push (operator
-            # reads via web UI).
-            pass
-        elif from_role == "user":
-            target.runtime.inbox.push_back(UserMessage(text=body, urgent=urgent))
-        else:
-            target.runtime.inbox.push_back(
-                AgentSendMessage(source=from_role, text=body, urgent=urgent),
-            )
-        return JSONResponse({"ok": True, "to": to, "from": from_role})
+        for to in recipients:
+            if to == "user":
+                continue
+            target = agent_registry.get(to)
+            if from_role == "user":
+                target.runtime.inbox.push_back(UserMessage(text=body, urgent=urgent))
+            else:
+                target.runtime.inbox.push_back(
+                    AgentSendMessage(source=from_role, text=body, urgent=urgent),
+                )
+
+        return JSONResponse({"ok": True, "to": recipients, "from": from_role})
 
     async def get_messages(request: Request) -> Response:
         """Tail the audit log. Optional ``?since=<iso8601>`` for delta polling.

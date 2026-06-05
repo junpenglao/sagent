@@ -1109,18 +1109,15 @@ async function sendMessage() {
   urgentNextSend = false;
   sendBtn.disabled = true;
   try {
-    // Fan-out: sagent's /api/post is single-target. CC by issuing one
-    // POST per recipient. The audit log records one entry per delivery,
-    // which matches sagent's per-target inbox semantics.
-    const results = await Promise.all(recipients.map(to =>
-      fetch('/api/post', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to, body, urgent }),
-      })
-    ));
-    const bad = results.find(r => !r.ok);
-    if (bad) throw new Error(await bad.text());
+    // Consolidated: send one POST with the full recipient list.
+    // The server emits a single audit record and performs the fan-out.
+    const response = await fetch('/api/post', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: recipients, body, urgent }),
+    });
+    if (!response.ok) throw new Error(await response.text());
+
     inputEl.value = '';
     autoResize();
   } catch (e) {

@@ -97,19 +97,27 @@ class AuditWriter:
             return
         msg = event.message
         records: list[dict[str, object]] = []
+        # Group multiple AgentSend calls with identical content into one audit record
+        content_to_recipients: dict[str, list[str]] = {}
         for tc in msg.tool_calls:
             if tc.name != "AgentSend":
                 continue
             args = tc.args if isinstance(tc.args, dict) else {}
             to = str(args.get("to", "")).strip()
-            content = str(args.get("content", ""))
-            if not to or not content:
+            body = str(args.get("content", ""))
+            if not to or not body:
                 continue
+            if body not in content_to_recipients:
+                content_to_recipients[body] = []
+            if to not in content_to_recipients[body]:
+                content_to_recipients[body].append(to)
+
+        for body, recipients in content_to_recipients.items():
             records.append({
                 "ts": _iso8601_z(),
                 "from": self.role_name,
-                "to": [to],
-                "body": content,
+                "to": recipients,
+                "body": body,
             })
         # Canonical v1/v2 design (restored 2026-06-04 17:xx UTC):
         # ONLY explicit ``AgentSend`` tool calls land in the audit

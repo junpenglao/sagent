@@ -28,6 +28,7 @@ def _deliver(
     sender: str,
     content: str,
     delay: int,
+    urgent: bool = False,
 ) -> None:
     """Deliver a delayed message into the target's inbox.
 
@@ -57,7 +58,7 @@ def _deliver(
         return
     body = f"[delayed {delay}s] {content}" if delay > 0 else content
     target.runtime.inbox.push_back(
-        AgentSendMessage(source=sender, text=body),
+        AgentSendMessage(source=sender, text=body, urgent=urgent),
     )
 
 
@@ -84,6 +85,10 @@ class AgentSend:
                     "type": "integer",
                     "minimum": 0,
                     "description": "Seconds to wait before delivering. Must be ≥ 0.",
+                },
+                "urgent": {
+                    "type": "boolean",
+                    "description": "If true, interrupt the target mid-turn (preempt). Use only for critical course corrections.",
                 },
             },
             "required": ["to", "content"],
@@ -156,6 +161,7 @@ class AgentSend:
         to = str(args.get("to", ""))
         content = str(args.get("content", ""))
         delay = opt_int(args, "delay")
+        urgent = bool(args.get("urgent", False))
         if not to:
             return ToolResult(call_id="", content="'to' is required.", is_error=True)
         if not content:
@@ -198,11 +204,12 @@ class AgentSend:
                 sender,
                 content,
                 delay,
+                urgent,
             )
             return ToolResult(call_id="", content=f"Scheduled for {to} in {delay}s.")
 
         target.runtime.inbox.push_back(
-            AgentSendMessage(source=sender, text=content),
+            AgentSendMessage(source=sender, text=content, urgent=urgent),
         )
         # Soft nudge on undelayed self-send: legitimate self-messages
         # carry a ``delay`` (scheduled reminders). Without one, this is

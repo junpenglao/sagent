@@ -233,6 +233,7 @@ import asyncio
 import contextlib
 import contextvars
 import dataclasses
+import asyncio
 import logging
 
 # Engine consumes a subset of the runtime event vocabulary. No re-export shim.
@@ -3051,7 +3052,6 @@ class AgentRuntime:
         except Exception as exc:  # noqa: BLE001 -- log_exception_or_warning routes UserFacingError to warning, others to exception; intentional catch-all for model-call failures
             from sagent.agent.retry import RateLimitError
             if isinstance(exc, RateLimitError):
-                import asyncio
                 from sagent.types.runtime import UserMessage, ModelResponseCancelled
                 intervals = [20.0, 30.0, 40.0]
                 delay = intervals[min(self._rate_limit_retries, len(intervals) - 1)]
@@ -3060,7 +3060,7 @@ class AgentRuntime:
                 logger.info("[%s] %s", self.session_id, self.status)
                 
                 def _do_resume():
-                    self.inbox.push_back(UserMessage(text="Autonomous resume.", hidden=True))
+                    from sagent.types.runtime import AgentSendMessage; self.inbox.push_back(AgentSendMessage(source="system", text="Autonomous resume (TPM backoff).", hidden=True))
                 
                 asyncio.get_running_loop().call_later(delay, _do_resume)
                 # Unwedge the runtime loop

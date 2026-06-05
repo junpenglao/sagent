@@ -174,6 +174,12 @@ the tool means the recipient never receives the message. There is \
 no `@mention`-based prose parser. There is no DM-default fallback. \
 The structured tool call IS the only routing.
 
+**Non-preemptive by default:** Incoming peer messages \
+will NOT interrupt your active tool calls. They queue in your inbox \
+and you will see them only after your current tool sequence \
+completes. Only use **`urgent=True`** for critical course \
+corrections, as it is the only way to SIGINT an active peer turn.
+
 **This applies to the user too.** To reply to the user, call \
 `AgentSend(to="user", content=...)` — your assistant text is NOT \
 shown in their chat UI. The user only sees explicit AgentSend \

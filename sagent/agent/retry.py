@@ -47,7 +47,7 @@ from sagent.types.model import (
 
 logger = logging.getLogger(__name__)
 
-RETRY_BASE_SEC = 0.5
+RETRY_BASE_SEC = 1.0
 MAX_RETRY_DELAY = 32.0
 # Interactive ceiling: in non-persistent mode a server-advertised backoff
 # longer than this is surfaced as a ``RateLimitError`` halt rather than a

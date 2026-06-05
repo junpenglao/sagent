@@ -78,6 +78,49 @@ _GOOGLE_THINKING_BUDGETS = {
 }
 
 
+
+class _TokenThrottler:
+    """Shared token-bucket throttler for TPM/RPM limiting."""
+
+    def __init__(self, max_tpm: int | None = None, max_rpm: int | None = None) -> None:
+        self.max_tpm = max_tpm
+        self.max_rpm = max_rpm
+        self._history: list[tuple[float, int]] = []
+        self._lock = asyncio.Lock()
+
+    async def wait_for_capacity(self, tokens: int) -> None:
+        if self.max_tpm is None and self.max_rpm is None:
+            return
+
+        while True:
+            async with self._lock:
+                now = asyncio.get_event_loop().time()
+                # Keep only last 60 seconds
+                self._history = [h for h in self._history if now - h[0] < 60]
+
+                rpm = len(self._history)
+                tpm = sum(h[1] for h in self._history)
+
+                if (self.max_rpm is None or rpm < self.max_rpm) and \
+                   (self.max_tpm is None or tpm + tokens <= self.max_tpm):
+                    self._history.append((now, tokens))
+                    return
+
+                # Determine how long to wait
+                if self._history:
+                    # Wait until the oldest entry in the window expires
+                    wait_sec = max(0.1, 60.1 - (now - self._history[0][0]))
+                else:
+                    wait_sec = 1.0
+
+            logger.info(
+                "Throttling: waiting %.2fs for capacity (TPM=%d, RPM=%d)",
+                wait_sec, tpm, rpm
+            )
+            await asyncio.sleep(wait_sec)
+
+
+
 class Google:
     """Google provider - creates Gemini model backends."""
 
@@ -150,21 +193,38 @@ class Google:
         ),
     }
 
-    def __init__(self, *, api_key: str) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        max_tpm: int | None = None,
+        max_rpm: int | None = None,
+    ) -> None:
         self.api_key = api_key
+        self.max_tpm = max_tpm
+        self.max_rpm = max_rpm
+        self._throttlers: dict[str, _TokenThrottler] = {}
 
     @classmethod
-    def from_key(cls, api_key: str) -> Google:
+    def from_key(
+        cls,
+        api_key: str,
+        *,
+        max_tpm: int | None = None,
+        max_rpm: int | None = None,
+    ) -> Google:
         """Create provider from an API key.
 
         Args:
           api_key: Google AI Studio API key.
+          max_tpm: Optional Tokens Per Minute limit.
+          max_rpm: Optional Requests Per Minute limit.
 
         Returns:
           provider: Configured Google provider instance.
 
         """
-        return cls(api_key=api_key)
+        return cls(api_key=api_key, max_tpm=max_tpm, max_rpm=max_rpm)
 
     @classmethod
     def from_env(cls) -> Google:
@@ -207,10 +267,17 @@ class Google:
             raise ValueError(
                 f"Unknown model {mid!r} for Google. Known models: {known}",
             )
+        if mid not in self._throttlers:
+            self._throttlers[mid] = _TokenThrottler(
+                max_tpm=self.max_tpm,
+                max_rpm=self.max_rpm,
+            )
+
         return _GeminiModel(
             provider=self,
             model_id=mid,
             profile=profile,
+            throttler=self._throttlers[mid],
             max_request_tokens=(
                 max_request_tokens
                 if max_request_tokens is not None
@@ -236,11 +303,13 @@ class _GeminiModel:
         provider: Google,
         model_id: str,
         profile: ModelProfile,
+        throttler: _TokenThrottler,
         max_request_tokens: int,
     ) -> None:
         self._provider = provider
         self._model_id = model_id
         self._profile = profile
+        self._throttler = throttler
         self._max_request_tokens = max_request_tokens
         self._client: httpx.AsyncClient | None = None
         self._client_lock = asyncio.Lock()
@@ -307,7 +376,7 @@ class _GeminiModel:
     @property
     def supports_cache_control(self) -> bool:
         """Whether the provider supports prompt caching."""
-        return False
+        return True
 
     @property
     def valid_service_tiers(self) -> tuple[str, ...]:
@@ -467,6 +536,9 @@ class _GeminiModel:
           ValueError: Server returns ``400`` for non-overflow reasons.
 
         """
+        tokens = self.approx_request_tokens(request)
+        await self._throttler.wait_for_capacity(tokens)
+
         url = f"{_API_BASE}/models/{self._model_id}:streamGenerateContent?alt=sse"
         body = _build_request(request, self.max_image_dim, self.max_image_bytes)
         client = await self._get_client()

@@ -62,6 +62,8 @@ Open questions for v3 testing:
 
 from __future__ import annotations
 
+_PROVIDER_CACHE = {}
+
 import os
 from pathlib import Path
 from typing import Sequence
@@ -300,11 +302,23 @@ def build_provider():
     only the API key + cost catalog; per-agent state lives on the
     Model returned by ``provider.model(...)``).
     """
+    if _PROVIDER in _PROVIDER_CACHE:
+        return _PROVIDER_CACHE[_PROVIDER]
+
     api_key = _load_api_key()
     if _PROVIDER == "google":
         from sagent.providers import Google
 
-        return Google.from_key(api_key)
+        max_tpm = os.environ.get("SAGENT_GOOGLE_MAX_TPM")
+        max_rpm = os.environ.get("SAGENT_GOOGLE_MAX_RPM")
+        
+        provider = Google.from_key(
+            api_key,
+            max_tpm=int(max_tpm) if max_tpm else None,
+            max_rpm=int(max_rpm) if max_rpm else None,
+        )
+        _PROVIDER_CACHE[_PROVIDER] = provider
+        return provider
     if _PROVIDER == "anthropic":
         from sagent.providers import Anthropic
 
@@ -472,6 +486,7 @@ def build_agent(
         # sagent core so it works here too.
         preempt_in_flight=True,
         coalesce_inbox=False,
+        persistent_retry=True,
     )
     _resume_if_persisted(agent, session_dir)
     # Mark the agent as persistent so ``_install_contextvars``

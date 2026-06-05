@@ -211,7 +211,7 @@ class AgentSend:
         # ``my_label`` (not ``sender``) so an unidentified context
         # sending to an agent literally named ``"unknown"`` doesn't
         # trip the nudge.
-        if my_label and to == my_label:
+        if my_label and to == my_label and (delay is None or delay == 0):
             return ToolResult(
                 call_id="",
                 content=(

@@ -93,6 +93,24 @@ class Google:
             max_response_tokens=65_536,
             pricing=Pricing(request=0.50, response=3.00, cache_read=0.05),
         ),
+        "gemini-3.5-flash": ModelProfile(
+            max_request_tokens=1_048_576,
+            max_response_tokens=65_536,
+            pricing=Pricing(
+                request=0.30,
+                response=2.50,
+                cache_read=0.075,
+            ),
+        ),
+        "gemini-3.1-flash-lite": ModelProfile(
+            max_request_tokens=1_048_576,
+            max_response_tokens=65_536,
+            pricing=Pricing(
+                request=0.10,
+                response=0.40,
+                cache_read=0.025,
+            ),
+        ),
         "gemini-3.1-pro-preview": ModelProfile(
             max_request_tokens=1_048_576,
             max_response_tokens=65_536,
@@ -550,19 +568,22 @@ def _build_request(
             _flush_tool_parts(contents, pending_tool_parts)
             model_parts: list[MutableJSON] = []
             if entry.text:
-                model_parts.append({"text": entry.text})
-            model_parts.extend(
-                cast(
-                    MutableJSON,
-                    {
-                        "functionCall": {
-                            "name": tc.name,
-                            "args": dict(tc.args),
-                        },
-                    },
-                )
-                for tc in entry.tool_calls
-            )
+                part: MutableJSON = {"text": entry.text}
+                if entry.thought_signature:
+                    part["thoughtSignature"] = entry.thought_signature
+                model_parts.append(part)
+            for tc in entry.tool_calls:
+                if tc.name == "DetachedArrived":
+                    continue
+                fc_part: MutableJSON = {
+                    "functionCall": {
+                        "name": tc.name,
+                        "args": dict(tc.args),
+                    }
+                }
+                if tc.thought_signature:
+                    fc_part["thoughtSignature"] = tc.thought_signature
+                model_parts.append(fc_part)
             if model_parts:
                 contents.append(
                     cast(MutableJSON, {"role": "model", "parts": model_parts})
@@ -571,6 +592,14 @@ def _build_request(
             # ToolResult: role=user with functionResponse part(s); image
             # attachments emit as inlineData siblings in the same user
             # content.
+            if entry.call_id.endswith(":detached"):
+                # Bypass synthetic arrival pairs for Gemini - convert to user text.
+                text = entry.content
+                if entry.is_error and text:
+                    text = f"[Error] {text}"
+                pending_tool_parts.append({"text": f"[Background result for {entry.call_id[:-9]}]:\n{text}"})
+                continue
+
             func_name = call_names.get(entry.call_id, entry.call_id)
             text = entry.content
             if entry.is_error and text:
@@ -696,6 +725,7 @@ async def _consume_gemini_stream(
     events.
     """
     text_chunks: list[str] = []
+    text_signature: str = ""
     thinking_chunks: list[str] = []
     tool_calls: list[ToolCall] = []
     usage: MutableJSON = {}
@@ -744,6 +774,8 @@ async def _consume_gemini_stream(
                             on_thinking(chunk)
                     elif isinstance(chunk, str):
                         text_chunks.append(chunk)
+                        if "thoughtSignature" in part:
+                            text_signature = cast(str, part["thoughtSignature"])
                         if on_text is not None:
                             on_text(chunk)
                 elif "functionCall" in part:
@@ -757,6 +789,7 @@ async def _consume_gemini_stream(
                                 id=tc_id,
                                 name=fc_name,
                                 args=cast(Mapping[str, object], fc_args),
+                                thought_signature=cast(str, part.get("thoughtSignature", "")),
                             )
                         )
 
@@ -765,6 +798,7 @@ async def _consume_gemini_stream(
 
     response = _build_response(
         text="".join(text_chunks),
+        text_signature=text_signature,
         thinking="".join(thinking_chunks),
         tool_calls=tool_calls,
         usage=usage,
@@ -779,6 +813,7 @@ async def _consume_gemini_stream(
 def _build_response(
     *,
     text: str,
+    text_signature: str = "",
     thinking: str = "",
     tool_calls: list[ToolCall],
     usage: MutableJSON,
@@ -800,6 +835,7 @@ def _build_response(
     return ModelResponse(
         message=AssistantMessage(
             text=text,
+            thought_signature=text_signature,
             thinking_blocks=({"type": "thinking", "thinking": thinking},)
             if thinking
             else (),

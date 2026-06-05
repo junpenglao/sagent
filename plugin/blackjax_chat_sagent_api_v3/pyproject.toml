@@ -8,7 +8,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-sagent = { git = "https://github.com/junpenglao/sagent.git", branch = "feat/cli-session-resume" }
+sagent = { path = "../../" }
 
 # When the upstream PR at rekursiv-ai/sagent merges, switch to:
 #   sagent = ">=<NEXT_RELEASE_VERSION>"

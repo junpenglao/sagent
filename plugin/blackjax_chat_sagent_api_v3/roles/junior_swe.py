@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .common import MODEL_DEFAULT, build_agent
+from .common import build_agent, model_for_role
 
 
 _ROLE_MD = Path(__file__).with_suffix("").with_name("junior-swe.md")
@@ -36,5 +36,5 @@ def build():
             tools.AgentSend(),
             tools.AgentSelf(),
         ],
-        model_id=MODEL_DEFAULT,
+        model_id=model_for_role("junior-swe"),
     )

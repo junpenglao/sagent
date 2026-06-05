@@ -179,6 +179,9 @@ class ToolCall:
     args: Mapping[str, object]
     """Parsed directive arguments."""
 
+    thought_signature: str = ""
+    """Provider-supplied thought signature for this call."""
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class UserMessage(SessionMessage):
@@ -246,6 +249,9 @@ class AssistantMessage(SessionMessage):
 
     tool_calls: tuple[ToolCall, ...] = ()
     """Tool invocations requested by the model."""
+
+    thought_signature: str = ""
+    """Provider-supplied thought signature for the text portion."""
 
     def __post_init__(self) -> None:
         # Duplicate ``ToolCall.id`` corrupts the runtime's per-call

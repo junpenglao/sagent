@@ -130,7 +130,7 @@ class AgentSend:
 
         """
         my_label = agent_label_var.get("")
-        others = sorted(k for k in agent_registry if k != my_label)
+        others = sorted(set(list(agent_registry) + ["user"]) - {my_label})
         identity = f"Your agent label is {my_label!r}." if my_label else ""
         if not others:
             return identity
@@ -169,9 +169,12 @@ class AgentSend:
                 is_error=True,
             )
 
+        if to == "user":
+            return ToolResult(call_id="", content="Delivered to user.")
+
         target = agent_registry.get(to)
         if target is None:
-            available = sorted(agent_registry)
+            available = sorted(set(list(agent_registry) + ["user"]))
             return ToolResult(
                 call_id="",
                 content=f"Unknown agent: {to!r}. Active: {available}",

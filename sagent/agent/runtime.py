@@ -3056,10 +3056,11 @@ class AgentRuntime:
                 self._rate_limit_retries += 1
                 self.status = f"Rate limited. Retrying in {int(delay)}s (Attempt {self._rate_limit_retries})..."
                 logger.info("[%s] %s", self.session_id, self.status)
-                self.inbox.push_back(
-                    UserMessage(text="Autonomous resume.", hidden=True),
-                    delay=delay,
-                )
+                
+                def _do_resume():
+                    self.inbox.push_back(UserMessage(text="Autonomous resume.", hidden=True))
+                
+                asyncio.get_running_loop().call_later(delay, _do_resume)
                 return
 
             log_exception_or_warning(logger, "model call failed", exc)

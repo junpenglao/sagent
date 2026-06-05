@@ -1044,6 +1044,8 @@ class AgentRuntime:
         # per-feature special case can re-derive commit timing/placement
         # (which is how the earlier split caused stranding / lone-round bugs).
         self._pending_commits: list[_PendingCommit] = []
+        self._rate_limit_retries: int = 0
+        self.status: str = ''
         # Original ``call_id``s whose detached result has already been
         # forward-delivered (or is queued to be). The forward-delivery
         # invariant is "at most one ``DetachedArrived`` pair per original
@@ -3032,6 +3034,8 @@ class AgentRuntime:
                 on_text,
                 on_thinking,
             )
+            self._rate_limit_retries = 0
+            self.status = ''
             self.inbox.push_back(
                 ModelResponseComplete(message=response, generation=generation),
             )
@@ -3045,6 +3049,19 @@ class AgentRuntime:
                 ModelResponseCancelled(output_chars_estimate=chars),
             )
         except Exception as exc:  # noqa: BLE001 -- log_exception_or_warning routes UserFacingError to warning, others to exception; intentional catch-all for model-call failures
+            from sagent.agent.retry import RateLimitError
+            if isinstance(exc, RateLimitError):
+                intervals = [20.0, 30.0, 40.0]
+                delay = intervals[min(self._rate_limit_retries, len(intervals) - 1)]
+                self._rate_limit_retries += 1
+                self.status = f"Rate limited. Retrying in {int(delay)}s (Attempt {self._rate_limit_retries})..."
+                logger.info("[%s] %s", self.session_id, self.status)
+                self.inbox.push_back(
+                    UserMessage(text="Autonomous resume.", hidden=True),
+                    delay=delay,
+                )
+                return
+
             log_exception_or_warning(logger, "model call failed", exc)
             self.inbox.push_back(ModelResponseError(exc))
 

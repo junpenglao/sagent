@@ -480,6 +480,7 @@ def build_agent(
         name=role_name,
         session_dir=session_dir,
         max_tool_call_rounds=max_tool_call_rounds,
+        max_attempts=20,
         max_budget_usd=max_budget_usd,
         # Same runtime-level overrides as v2 — these are provider-
         # agnostic. The urgent flag gating (added 2026-06-04) is in

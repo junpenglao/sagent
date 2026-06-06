@@ -16,20 +16,6 @@
     if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
   })();
 
-async function loadAgents() {
-  try {
-    const d = await (await fetch("/api/agents")).json();
-    d.agents.forEach(a => {
-      const el = document.querySelector(`.member[data-role="${a.role}"] .spend`);
-      if (el && a.total_cost_usd != null) {
-        el.textContent = "$" + a.total_cost_usd.toFixed(3);
-        el.title = `In: ${a.total_in_tokens} / Out: ${a.total_out_tokens}`;
-      }
-    });
-  } catch (e) {}
-}
-setInterval(loadAgents, 4000);
-</script>
 <style>
   :root {
     --bg: #1e1f22;
@@ -1272,6 +1258,15 @@ function renderTraceEvent(ev) {
     row.className = 'ev tool';
     row.innerHTML = `<span class="ets">${ts}</span>
       <span class="name">tool</span> ${escapeHtml((ev.text || ev.label || '').slice(0, 160))}`;
+    traceBody.appendChild(row);
+    return;
+  }
+  if (kind === "ModelResponseCancelled") {
+    const row = document.createElement("div");
+    row.className = "ev";
+    row.innerHTML = `<span class="ets">${ts}</span>
+      <span class="marker" style="color:var(--text-mute)">●</span>
+      <span style="color:var(--text-mute);font-weight:600">CANCELLED</span> (TPM backoff)`;
     traceBody.appendChild(row);
     return;
   }

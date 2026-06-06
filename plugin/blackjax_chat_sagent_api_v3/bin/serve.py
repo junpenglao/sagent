@@ -23,18 +23,22 @@ import argparse
 import asyncio
 import json
 import logging
-_COSTS = {
-    "gemini-3.1-pro-preview": (1.25, 5.00),  # $/1M input, $/1M output
-    "gemini-3.5-flash": (0.075, 0.30),
-    "gemini-3.1-flash-lite": (0.01, 0.04),
-    "_default": (0.1, 0.4),
-}
 
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
+
+# Per-million-token cost rates (input, output) in USD.
+# Source: https://ai.google.dev/pricing (as of 2026-06-05).
+# _default: safe high-side fallback for experimental/preview models.
+_COSTS = {
+    "gemini-3.1-pro-preview": (1.25, 5.00),  # $/1M input, $/1M output
+    "gemini-3.5-flash": (0.075, 0.30),
+    "gemini-3.1-flash-lite": (0.01, 0.04),
+    "_default": (0.1, 0.4),
+}
 
 # Make sibling packages (``roles``, ``runtime``) importable when this
 # script is run via its full path (the production form).

@@ -321,6 +321,9 @@ function traceEventLine(ev, q) {
   if (kind === 'ModelResponseError') {
     return `${ts}● <span class="mk-supp">ERROR</span> ${esc(ev.error || 'unknown')}`;
   }
+  if (kind === "ModelResponseCancelled") {
+    return `${ts}● <span class="mk-supp">CANCELLED</span> (backoff)`;
+  }
   if (kind === 'ModelIdle' || kind === 'AgentIdle') {
     return `${ts}● ${esc(kind.toLowerCase())}`;
   }

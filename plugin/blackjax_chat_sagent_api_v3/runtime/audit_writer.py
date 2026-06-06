@@ -97,28 +97,38 @@ class AuditWriter:
             return
         msg = event.message
         records: list[dict[str, object]] = []
-        # Group multiple AgentSend calls with identical content into one audit record
+        # Group multiple AgentSend calls with identical content into one audit record.
+        # Track urgency per content group: if any call in the group is urgent,
+        # the entire audit record is marked urgent.
         content_to_recipients: dict[str, list[str]] = {}
+        content_to_urgent: dict[str, bool] = {}
         for tc in msg.tool_calls:
             if tc.name != "AgentSend":
                 continue
             args = tc.args if isinstance(tc.args, dict) else {}
             to = str(args.get("to", "")).strip()
             body = str(args.get("content", ""))
+            urgent = bool(args.get("urgent", False))
             if not to or not body:
                 continue
             if body not in content_to_recipients:
                 content_to_recipients[body] = []
+                content_to_urgent[body] = False
             if to not in content_to_recipients[body]:
                 content_to_recipients[body].append(to)
+            if urgent:
+                content_to_urgent[body] = True
 
         for body, recipients in content_to_recipients.items():
-            records.append({
+            record = {
                 "ts": _iso8601_z(),
                 "from": self.role_name,
                 "to": recipients,
                 "body": body,
-            })
+            }
+            if content_to_urgent[body]:
+                record["urgent"] = True
+            records.append(record)
         # Canonical v1/v2 design (restored 2026-06-04 17:xx UTC):
         # ONLY explicit ``AgentSend`` tool calls land in the audit
         # log + web UI. Assistant text without an AgentSend stays in
@@ -137,10 +147,8 @@ class AuditWriter:
         # forwarded it to @swe...") and leaked it to the chat. The
         # operator's expectation is right: silence means the model
         # didn't intend to message them.
-        # Note: ``urgent`` is intentionally not surfaced here. The
-        # operator can opt in to plumbing it once sagent's
-        # AgentSend exposes the flag (see "deferred" item in the
-        # v3 research notes).
+        # Note: ``urgent`` is now surfaced since AgentSend was extended
+        # to support it. Matches v2 schema for operator visibility.
         if not records:
             return
         try:

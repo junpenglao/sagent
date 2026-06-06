@@ -112,7 +112,7 @@ _PROVIDER_MODELS: dict[str, dict[str, str]] = {
     "google": {
         "tl": "gemini-3.1-pro-preview",
         "swe": "gemini-3.5-flash",
-        "statistician": "gemini-3.5-flash",
+        "statistician": "gemini-3.1-pro-preview",
         "junior-swe": "gemini-3.1-flash-lite",
         "tech-writer": "gemini-3.1-flash-lite",
         "_default": "gemini-3.5-flash",

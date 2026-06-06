@@ -15,6 +15,20 @@
     }
     if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
   })();
+
+async function loadAgents() {
+  try {
+    const d = await (await fetch("/api/agents")).json();
+    d.agents.forEach(a => {
+      const el = document.querySelector(`.member[data-role="${a.role}"] .spend`);
+      if (el && a.total_cost_usd != null) {
+        el.textContent = "$" + a.total_cost_usd.toFixed(3);
+        el.title = `In: ${a.total_in_tokens} / Out: ${a.total_out_tokens}`;
+      }
+    });
+  } catch (e) {}
+}
+setInterval(loadAgents, 4000);
 </script>
 <style>
   :root {
@@ -897,6 +911,7 @@ async function loadMembers() {
       m.innerHTML = `
         <span class="dot" style="background:${roleColor(role)}"></span>
         <span class="label">${role}</span>
+        <span class="spend" style="font-size:10px;color:var(--text-mute);margin-left:auto"></span>
         <span class="badge"></span>`;
       m.addEventListener('click', () => openTrace(role));
       el.appendChild(m);
@@ -1432,6 +1447,20 @@ async function openTrace(role) {
   setInterval(pollMessages, 1500);
   inputEl.focus();
 })();
+
+async function loadAgents() {
+  try {
+    const d = await (await fetch("/api/agents")).json();
+    d.agents.forEach(a => {
+      const el = document.querySelector(`.member[data-role="${a.role}"] .spend`);
+      if (el && a.total_cost_usd != null) {
+        el.textContent = "$" + a.total_cost_usd.toFixed(3);
+        el.title = `In: ${a.total_in_tokens} / Out: ${a.total_out_tokens}`;
+      }
+    });
+  } catch (e) {}
+}
+setInterval(loadAgents, 4000);
 </script>
 </body>
 </html>

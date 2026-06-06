@@ -23,6 +23,13 @@ import argparse
 import asyncio
 import json
 import logging
+_COSTS = {
+    "gemini-3.1-pro-preview": (1.25, 5.00),  # $/1M input, $/1M output
+    "gemini-3.5-flash": (0.075, 0.30),
+    "gemini-3.1-flash-lite": (0.01, 0.04),
+    "_default": (0.1, 0.4),
+}
+
 import os
 import sys
 from datetime import datetime, timezone
@@ -161,6 +168,22 @@ def _diagnose_agent(label: str, agent: object) -> dict:
         elif k in ("ModelIdle", "ModelResponseComplete", "ModelResponseError"):
             ended_idx = i
     in_turn = started_idx > ended_idx
+
+    # Aggregate telemetry from trace.
+    total_in_tokens = 0
+    total_out_tokens = 0
+    total_cost_usd = 0.0
+    for ev in events:
+        if ev.get("_event") == "ModelResponseComplete":
+            in_t = ev.get("input_tokens", 0) or 0
+            out_t = ev.get("output_tokens", 0) or 0
+            total_in_tokens += in_t
+            total_out_tokens += out_t
+            
+            # Estimate cost
+            model_id = getattr(agent, "model_id", "_default")
+            rates = _COSTS.get(model_id, _COSTS["_default"])
+            total_cost_usd += (in_t * rates[0] + out_t * rates[1]) / 1_000_000
 
     # Best-effort inflight tool name.
     inflight: str | None = None

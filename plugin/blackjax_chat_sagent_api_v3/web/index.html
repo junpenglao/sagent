@@ -15,6 +15,7 @@
     }
     if (t === 'light') document.documentElement.setAttribute('data-theme', 'light');
   })();
+</script>
 
 <style>
   :root {
@@ -1441,6 +1442,8 @@ async function openTrace(role) {
   setConn('ok', '● live');
   setInterval(pollMessages, 1500);
   inputEl.focus();
+  loadAgents();
+  setInterval(loadAgents, 4000);
 })();
 
 async function loadAgents() {
@@ -1455,7 +1458,8 @@ async function loadAgents() {
     });
   } catch (e) {}
 }
-setInterval(loadAgents, 4000);
+
+
 </script>
 </body>
 </html>

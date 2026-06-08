@@ -21,11 +21,19 @@ from sagent.providers.anthropic_cli_session.parser import (
     iter_jsonl,
     parse_jsonl_to_messages,
 )
+from sagent.providers.anthropic_cli_session.tripwire import (
+    DiffFinding,
+    is_safe_to_enable,
+    structural_diff,
+)
 
 
 __all__ = [
+    "DiffFinding",
+    "is_safe_to_enable",
     "iter_jsonl",
     "materialize_session",
     "parse_jsonl_to_messages",
     "session_jsonl_path",
+    "structural_diff",
 ]

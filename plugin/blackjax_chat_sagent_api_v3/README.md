@@ -45,10 +45,10 @@ Open questions the comparison should answer (informed by v2's
 
 Live testing of the v3 architecture against high-volume implementation tasks (MCLMC paper validation) yielded the following answers to our initial questions:
 
-1.  **✅ Native Tool Dispatch is Flawless.** Gemini 3.x and Anthropic direct APIs correctly emit structured function calls. The MCP shim is officially obsolete in the v3 path.
-2.  **✅ SSE Preemption Works.** Aborting the `httpx` stream correctly triggers a `ModelResponseCancelled` event. This was verified during "friendly fire" incidents where tech-lead status checks interrupted synchronous benchmarks.
-3.  **✅ Substantial Cost Reduction.** Even with "Thinking Tier" Pro models for coordination, aggregate team costs dropped from ~$6.30/day (v2 Opus) to **<$1.00/day (v3 mixed tier)**.
-4.  **⚠️ New Failure Mode: The "Jacobian Tail" of Rate Limits.** We discovered that Tier 1 API limits (1M TPM) are hit much faster by multi-agent bursts than by the single-user CLI. This necessitated the building of the Throttler and Autonomous Resume mechanisms (see Infrastructure section).
+1. **✅ Native Tool Dispatch is Flawless.** Gemini 3.x and Anthropic direct APIs correctly emit structured function calls. The MCP shim is officially obsolete in the v3 path.
+2. **✅ SSE Preemption Works.** Aborting the `httpx` stream correctly triggers a `ModelResponseCancelled` event. This was verified during "friendly fire" incidents where tech-lead status checks interrupted synchronous benchmarks.
+3. **✅ Substantial Cost Reduction.** Even with "Thinking Tier" Pro models for coordination, aggregate team costs are materially below v2 Opus (~$6.30/day baseline). The in-UI spend counter (sidebar + `/api/agents`) exposes the live per-role $ for empirical anchoring per session — the headline ratio is workload-dependent.
+4. **⚠️ New Failure Mode: Tier 1 TPM Saturation.** We discovered that Tier 1 API limits (1M TPM) are hit much faster by multi-agent bursts than by the single-user CLI. This necessitated the building of the Throttler and Autonomous Resume mechanisms (see Infrastructure section).
 
 ## Cognitive Model Tiering
 
@@ -70,7 +70,7 @@ Since the initial scaffold, the following structural enhancements were implement
 
 ### 2. Autonomous Self-Healing (429 Backoff)
 - **Motivation**: Transient 429s (Resource Exhausted) previously killed agent turns, requiring manual resume.
-- **Solution**: Equiped `AgentRuntime` with a stateful backoff handler. It catches `RateLimitError`, schedules a hidden system-labeled wake-up message via `asyncio.call_later`, and pushes `ModelResponseCancelled` to cleanly close the turn boundary.
+- **Solution**: Equipped `AgentRuntime` with a stateful backoff handler. It catches `RateLimitError`, schedules a hidden system-labeled wake-up message via `asyncio.call_later`, and pushes `ModelResponseCancelled` to cleanly close the turn boundary.
 
 ### 3. Structural Preemption & `urgent` Flag
 - **Motivation**: Default preemption was too destructive, killing long-running JAX benchmarks for minor coordination.
@@ -141,7 +141,7 @@ uv run python bin/serve.py --port 8767
 ## Security & Operational Safety
 
 The build has been hardened against common operational hazards:
-- **SandboxedBash**: Re-verified with a 24-case unit test suite blocking destructive git/system commands.
+- **SandboxedBash**: Re-verified with a 22-case unit test suite blocking destructive git/system commands.
 - **Leak Protection**: Verified zero leakage of opaque `thoughtSignature` strings into operator-visible logs.
 - **Audit Schema**: Surfaced the `urgent` flag in the canonical audit log for full transparency.
 
@@ -149,4 +149,4 @@ The build has been hardened against common operational hazards:
 
 **STABLE / PRODUCTION-READY.** 
 
-v3 is the current standard for the BlackJAX multi-agent team. It has successfully executed the MCLMC paper replication (confirming a 9.7x efficiency gain on 1600-D targets) while maintaining perfect stability under Tier 1 API limits.
+v3 is the current standard for the BlackJAX multi-agent team. It has successfully executed the MCLMC paper replication (confirming an 11.1x total-efficiency gain on the 1600-D LGCP target) while maintaining stability under Tier 1 API limits.

@@ -24,8 +24,10 @@ Conventions:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
+
+import os
 
 
 # Per-role model assignments mirror ``claude-config/project/.claude/agents/<role>.md``
@@ -213,10 +215,22 @@ def build_agent(
 
     Returns:
         A configured Agent ready to be registered + driven.
+
     """
     from sagent.agent import Agent
 
     provider = build_provider()
+    # v2.1-α opt-in: when ``SAGENT_CLI_OWN_SESSION=1``, sagent rewrites
+    # the on-disk session JSONL from its tape view before every
+    # ``--resume`` spawn (instead of trusting whatever claude wrote on
+    # the prior turn). Default off → v2 behaviour. See
+    # ``sagent/providers/anthropic_cli_session/`` and the
+    # ``v2.1-cli-session-materialize`` worklog thread.
+    materialize_session = os.environ.get("SAGENT_CLI_OWN_SESSION", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     # NOTE: must not collide with sagent's bridge server name (``"sagent"``,
     # hardcoded at sagent/providers/lib/mcp_bridge.py:175). The bridge
     # exposes Read/Bash/Glob/Grep/etc. as ``mcp__sagent__<tool>``; the
@@ -234,6 +248,7 @@ def build_agent(
             # of inheriting a stripped re-feed. See sagent commit on
             # ``feat/cli-session-resume`` for the full rationale.
             session_id=_session_id_for(role_name),
+            materialize_session=materialize_session,
         ),
         model_spec=_model_spec_for(model_id),
         system=load_system_prompt(role_md_path),

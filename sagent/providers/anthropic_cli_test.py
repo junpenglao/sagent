@@ -758,6 +758,7 @@ def test_dispatch_stream_event_routes_text_and_thinking() -> None:
     """``content_block_delta`` events fan text/thinking into separate buckets."""
     text_parts: list[str] = []
     thinking_parts: list[str] = []
+    signature_parts: list[str] = []
     text_chunks: list[str] = []
     thinking_chunks: list[str] = []
     tool_use_blocks: dict[int, dict[str, object]] = {}
@@ -779,6 +780,7 @@ def test_dispatch_stream_event_routes_text_and_thinking() -> None:
         text_event,
         text_parts,
         thinking_parts,
+        signature_parts,
         tool_use_blocks,
         on_text=text_chunks.append,
         on_thinking=thinking_chunks.append,
@@ -787,14 +789,54 @@ def test_dispatch_stream_event_routes_text_and_thinking() -> None:
         thinking_event,
         text_parts,
         thinking_parts,
+        signature_parts,
         tool_use_blocks,
         on_text=text_chunks.append,
         on_thinking=thinking_chunks.append,
     )
     assert text_parts == ["hello"]
     assert thinking_parts == ["reflecting"]
+    assert signature_parts == []  # no signature_delta yet
     assert text_chunks == ["hello"]
     assert thinking_chunks == ["reflecting"]
+
+
+def test_dispatch_stream_event_captures_signature_delta() -> None:
+    """``signature_delta`` events feed the signature accumulator.
+
+    Required for v2.1-α materializer mode: claude's stream emits a
+    ``signature_delta`` event after the thinking body, carrying the
+    opaque thought signature. The stream parser MUST capture it —
+    without it, ``AssistantMessage.thinking_blocks`` carry blocks
+    with no signature, the materializer writes them unsigned to
+    JSONL, and Anthropic's API rejects on the next ``--resume`` wire
+    send with ``HTTP 400 thinking.signature: Field required``.
+    Verified live 2026-06-09 in statistician session
+    ``b4fe5972-...`` after TL sent a thank-you AgentSendMessage.
+    """
+    text_parts: list[str] = []
+    thinking_parts: list[str] = []
+    signature_parts: list[str] = []
+    tool_use_blocks: dict[int, dict[str, object]] = {}
+    sig_event = cast(
+        MutableJSON,
+        {
+            "type": "content_block_delta",
+            "delta": {"type": "signature_delta", "signature": "abc123"},
+        },
+    )
+    _dispatch_stream_event(
+        sig_event,
+        text_parts,
+        thinking_parts,
+        signature_parts,
+        tool_use_blocks,
+        on_text=None,
+        on_thinking=None,
+    )
+    assert signature_parts == ["abc123"]
+    assert text_parts == []
+    assert thinking_parts == []
 
 
 def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
@@ -809,6 +851,7 @@ def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
     try:
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        signature_parts: list[str] = []
         tool_use_blocks: dict[int, dict[str, object]] = {}
         # 1) start: registers tool_use at index 0 -- NO label published yet
         _dispatch_stream_event(
@@ -827,6 +870,7 @@ def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
             ),
             text_parts,
             thinking_parts,
+            signature_parts,
             tool_use_blocks,
             on_text=None,
             on_thinking=None,
@@ -845,6 +889,7 @@ def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
                 ),
                 text_parts,
                 thinking_parts,
+                signature_parts,
                 tool_use_blocks,
                 on_text=None,
                 on_thinking=None,
@@ -858,6 +903,7 @@ def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
             ),
             text_parts,
             thinking_parts,
+            signature_parts,
             tool_use_blocks,
             on_text=None,
             on_thinking=None,
@@ -891,6 +937,7 @@ def test_dispatch_stream_event_no_label_for_text_block_start() -> None:
             ),
             [],
             [],
+            [],
             tool_use_blocks,
             on_text=None,
             on_thinking=None,
@@ -898,6 +945,7 @@ def test_dispatch_stream_event_no_label_for_text_block_start() -> None:
         # And a content_block_stop on the text block: no label.
         _dispatch_stream_event(
             cast(MutableJSON, {"type": "content_block_stop", "index": 1}),
+            [],
             [],
             [],
             tool_use_blocks,
@@ -910,26 +958,38 @@ def test_dispatch_stream_event_no_label_for_text_block_start() -> None:
 
 
 def test_dispatch_stream_event_ignores_unknown_delta_types() -> None:
-    """A non-text/thinking delta does not perturb the accumulators."""
+    """A delta type we don't recognize does not perturb any accumulator.
+
+    Historical note: this test previously used ``signature_delta`` as
+    the exemplar "unknown" type because the parser intentionally
+    dropped it. Capturing the signature became load-bearing once
+    v2.1-α materialize mode started re-sending history via wire, so
+    ``signature_delta`` moved into the known set. We use a genuinely
+    unknown type (``fake_future_delta``) to keep the contract
+    semantics — the parser stays inert on shapes it doesn't know.
+    """
     text_parts: list[str] = []
     thinking_parts: list[str] = []
+    signature_parts: list[str] = []
     tool_use_blocks: dict[int, dict[str, object]] = {}
     _dispatch_stream_event(
         cast(
             MutableJSON,
             {
                 "type": "content_block_delta",
-                "delta": {"type": "signature_delta", "signature": "x"},
+                "delta": {"type": "fake_future_delta", "payload": "x"},
             },
         ),
         text_parts,
         thinking_parts,
+        signature_parts,
         tool_use_blocks,
         on_text=None,
         on_thinking=None,
     )
     assert text_parts == []
     assert thinking_parts == []
+    assert signature_parts == []
 
 
 def test_build_model_response_sums_model_usage_rows() -> None:
@@ -959,6 +1019,7 @@ def test_build_model_response_sums_model_usage_rows() -> None:
         usage_event=usage_event,
         text="reply",
         thinking_parts=["thought"],
+        signature_parts=["sig-bytes"],
         stop_reason="end_turn",
         fallback_message_id="fallback",
     )
@@ -969,6 +1030,13 @@ def test_build_model_response_sums_model_usage_rows() -> None:
     assert response.stop_reason == "model_finished"
     assert response.message_id == "sid-x"
     assert len(response.message.thinking_blocks) == 1
+    # Signature MUST be carried alongside the thinking body — otherwise
+    # a subsequent wire send fails with HTTP 400
+    # ``thinking.signature: Field required``.
+    block = response.message.thinking_blocks[0]
+    assert block.get("type") == "thinking"
+    assert block.get("thinking") == "thought"
+    assert block.get("signature") == "sig-bytes"
 
 
 def test_build_model_response_falls_back_to_total_cost_usd() -> None:
@@ -986,6 +1054,7 @@ def test_build_model_response_falls_back_to_total_cost_usd() -> None:
         usage_event=usage_event,
         text="",
         thinking_parts=[],
+        signature_parts=[],
         stop_reason="end_turn",
         fallback_message_id="m",
     )

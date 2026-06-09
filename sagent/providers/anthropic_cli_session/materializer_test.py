@@ -265,6 +265,190 @@ def test_orphan_thinking_block_dropped(tmp_home: Path) -> None:
     assert blocks == [{"type": "text", "text": "ok"}]
 
 
+def test_compact_boundary_drops_preceding_entries(tmp_home: Path) -> None:
+    """Parser respects claude's compact_boundary chain reset.
+
+    Claude's auto-compact writes a ``system/compact_boundary`` entry
+    with ``parentUuid=None`` and chains subsequent entries off it,
+    making everything before the boundary "compacted away" on
+    ``--resume``. The parser must drop the pre-boundary entries; if
+    it preserves them, a re-materialization carries duplicate
+    context and the next ``--resume`` hits the same context limit
+    that triggered the compaction in the first place.
+
+    Verified against real claude-written JSONL at
+    ``~/.claude/projects/.../*.jsonl`` 2026-06-09: the
+    compact_boundary at index 400 of a 1087-entry file had
+    ``parentUuid=None``; the entry at 401 chained off the boundary's
+    uuid; entries 0-399 were unreachable from the post-boundary chain.
+    """
+    sid = "00000001-1111-2222-3333-444444444444"
+    path = tmp_home / ".claude" / "projects" / "-tmp-test" / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    base = {
+        "sessionId": sid,
+        "cwd": "/tmp/test",
+        "gitBranch": "HEAD",
+        "version": "test",
+        "userType": "external",
+        "entrypoint": "cli",
+        "isSidechain": False,
+        "timestamp": "2026-06-09T00:00:00.000Z",
+    }
+    pre_uuid = "00000001-aaaa-bbbb-cccc-000000000001"
+    boundary_uuid = "00000001-aaaa-bbbb-cccc-000000000002"
+    summary_uuid = "00000001-aaaa-bbbb-cccc-000000000003"
+
+    entries = [
+        # Pre-compaction history (should be dropped)
+        {
+            **base,
+            "type": "user",
+            "parentUuid": None,
+            "uuid": pre_uuid,
+            "message": {"role": "user", "content": "pre-compaction turn"},
+        },
+        # The boundary marker (system entry, parentUuid=None reset)
+        {
+            **base,
+            "type": "system",
+            "subtype": "compact_boundary",
+            "parentUuid": None,
+            "uuid": boundary_uuid,
+            "content": "Conversation compacted",
+        },
+        # The summary user entry (should survive)
+        {
+            **base,
+            "type": "user",
+            "parentUuid": boundary_uuid,
+            "uuid": summary_uuid,
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "summary of prior conversation"},
+        },
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    msgs = parse_jsonl_to_messages(path)
+    assert len(msgs) == 1, f"expected 1 message (summary only), got {len(msgs)}: {msgs}"
+    assert isinstance(msgs[0], UserMessage)
+    assert msgs[0].text == "summary of prior conversation"
+
+
+def test_multiple_compact_boundaries_only_last_one_matters(tmp_home: Path) -> None:
+    """When claude compacted twice, only the most recent summary survives.
+
+    The 2.9MB real claude session inspected 2026-06-09 had boundaries
+    at indices 0 and 400 of 1087 entries — the 0-400 stretch was
+    itself a post-compaction continuation that then got compacted
+    again. Pre-second-boundary entries are unreachable from the
+    final chain.
+    """
+    sid = "00000002-1111-2222-3333-444444444444"
+    path = tmp_home / ".claude" / "projects" / "-tmp-test" / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base = {
+        "sessionId": sid,
+        "cwd": "/tmp/test",
+        "gitBranch": "HEAD",
+        "version": "test",
+        "userType": "external",
+        "entrypoint": "cli",
+        "isSidechain": False,
+        "timestamp": "2026-06-09T00:00:00.000Z",
+    }
+
+    def mk(uid: str, parent: str | None, content: str, **extra) -> dict[str, object]:
+        return {
+            **base,
+            "type": "user",
+            "parentUuid": parent,
+            "uuid": uid,
+            "message": {"role": "user", "content": content},
+            **extra,
+        }
+
+    b1 = "00000002-aaaa-0000-0000-000000000001"
+    s1 = "00000002-aaaa-0000-0000-000000000002"
+    b2 = "00000002-aaaa-0000-0000-000000000003"
+    s2 = "00000002-aaaa-0000-0000-000000000004"
+
+    entries = [
+        {
+            **base,
+            "type": "system",
+            "subtype": "compact_boundary",
+            "parentUuid": None,
+            "uuid": b1,
+            "content": "first compaction",
+        },
+        mk(s1, b1, "first summary", isCompactSummary=True),
+        # ... intermediate turns ...
+        mk("00000002-aaaa-0000-0000-000000000010", s1, "follow-up after compaction 1"),
+        # Second compaction
+        {
+            **base,
+            "type": "system",
+            "subtype": "compact_boundary",
+            "parentUuid": None,
+            "uuid": b2,
+            "content": "second compaction",
+        },
+        mk(s2, b2, "second summary", isCompactSummary=True),
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    msgs = parse_jsonl_to_messages(path)
+    assert len(msgs) == 1, f"expected only second summary; got {msgs}"
+    assert isinstance(msgs[0], UserMessage)
+    assert msgs[0].text == "second summary"
+
+
+def test_no_compact_boundary_means_no_drop(tmp_home: Path) -> None:
+    """Sessions without any compact_boundary entry parse end-to-end.
+
+    Sanity guard so the boundary detection doesn't break the
+    common case.
+    """
+    sid = "00000003-1111-2222-3333-444444444444"
+    path = tmp_home / ".claude" / "projects" / "-tmp-test" / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base = {
+        "sessionId": sid,
+        "cwd": "/tmp/test",
+        "gitBranch": "HEAD",
+        "version": "test",
+        "userType": "external",
+        "entrypoint": "cli",
+        "isSidechain": False,
+        "timestamp": "2026-06-09T00:00:00.000Z",
+    }
+    u1 = "00000003-aaaa-0000-0000-000000000001"
+    u2 = "00000003-aaaa-0000-0000-000000000002"
+    entries = [
+        {
+            **base,
+            "type": "user",
+            "parentUuid": None,
+            "uuid": u1,
+            "message": {"role": "user", "content": "first turn"},
+        },
+        {
+            **base,
+            "type": "user",
+            "parentUuid": u1,
+            "uuid": u2,
+            "message": {"role": "user", "content": "second turn"},
+        },
+    ]
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    msgs = parse_jsonl_to_messages(path)
+    assert len(msgs) == 2
+    assert all(isinstance(m, UserMessage) for m in msgs)
+
+
 def test_assistant_ending_in_thinking_is_not_padded(tmp_home: Path) -> None:
     """Materializer leaves a ``[thinking]``-only entry unpadded.
 

@@ -71,8 +71,32 @@ def parse_jsonl_to_messages(path: Path) -> list[object]:
     a list of ``tool_result`` blocks is split back into one
     ``ToolResult`` per block (matching the sagent tape model, where
     each tool produces its own ``ToolResult``).
+
+    **Compaction handling.** Claude's CLI auto-compacts mid-session by
+    writing a ``system`` entry with ``subtype="compact_boundary"`` plus
+    a ``parentUuid=None`` chain reset, followed by a synthetic user
+    entry whose ``isCompactSummary=True`` carries the compaction
+    summary text. On ``--resume`` claude treats only entries AFTER the
+    last compact_boundary as the live conversation. The parser mirrors
+    that semantic: it locates the LAST compact_boundary in the file
+    and drops every chain-bearing entry before it. The summary user
+    entry that follows survives as a regular UserMessage; downstream
+    code reads it as the conversation's starting context.
     """
-    return list(_parse_entries(iter_jsonl(path)))
+    entries = list(iter_jsonl(path))
+    boundary_idx = _last_compact_boundary_index(entries)
+    if boundary_idx >= 0:
+        entries = entries[boundary_idx + 1 :]
+    return list(_parse_entries(entries))
+
+
+def _last_compact_boundary_index(entries: list[dict[str, Any]]) -> int:
+    """Return the index of the last ``system/compact_boundary`` entry, or -1."""
+    for i in range(len(entries) - 1, -1, -1):
+        e = entries[i]
+        if e.get("type") == "system" and e.get("subtype") == "compact_boundary":
+            return i
+    return -1
 
 
 def _parse_entries(entries: Iterable[dict[str, Any]]) -> Iterator[object]:

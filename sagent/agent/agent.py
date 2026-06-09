@@ -1895,11 +1895,30 @@ class Agent:
             # about to be sent, not the previous one; without it the
             # proactive gate lags one turn behind the growing context.
             used += self._tokens_appended_since_last_response(history, model)
-        if not self._agent_compactor.should_compact(
+        system_tokens = model.approx_text_tokens(self.system_prompt())
+        should = self._agent_compactor.should_compact(
             current_tokens=used,
             max_request_tokens=self.max_request_tokens,
-            system_tokens=model.approx_text_tokens(self.system_prompt()),
-        ):
+            system_tokens=system_tokens,
+        )
+        # DIAGNOSTIC (2026-06-09): trace the compaction-trigger inputs to
+        # root-cause the TL over-trigger observed at ~16k tokens against a
+        # 200k window (static math says should_compact must return False
+        # there). Logs the exact inputs on every model call so we can see
+        # whether ``used`` / ``system_tokens`` are mis-estimated or the
+        # threshold formula is wrong. Remove once root-caused.
+        logger.info(
+            "compact_trigger_probe: agent=%s used=%d last_input=%d "
+            "appended_est=%d system=%d max_request=%d -> compact=%s",
+            self.name,
+            used,
+            self._last_input_tokens,
+            (used - self._last_input_tokens) if self._last_input_tokens > 0 else 0,
+            system_tokens,
+            self.max_request_tokens,
+            should,
+        )
+        if not should:
             self.compaction_state.compact_failures = 0
             return True
         # Circuit breaker: after N consecutive auto-compact failures, stop

@@ -82,12 +82,55 @@ def parse_jsonl_to_messages(path: Path) -> list[object]:
     and drops every chain-bearing entry before it. The summary user
     entry that follows survives as a regular UserMessage; downstream
     code reads it as the conversation's starting context.
+
+    **Consecutive-assistant coalescing.** Claude writes ONE assistant
+    turn as MULTIPLE consecutive ``assistant`` JSONL entries -- a
+    separate entry per content block (thinking, then text, then each
+    tool_use). Emitting one ``AssistantMessage`` per entry would put
+    consecutive assistant-role messages on the tape, which violates the
+    role-alternation invariant the tape enforces when a ``ContextSplice``
+    (compaction) is later built -- raising
+    ``InvalidPayloadError("payload violates role alternation")``. So we
+    merge consecutive ``AssistantMessage`` runs into one, concatenating
+    their thinking_blocks / text / tool_calls back into the single
+    logical turn the sagent tape model expects (and that Anthropic's
+    wire format requires: one assistant message per turn carrying all
+    blocks).
     """
     entries = list(iter_jsonl(path))
     boundary_idx = _last_compact_boundary_index(entries)
     if boundary_idx >= 0:
         entries = entries[boundary_idx + 1 :]
-    return list(_parse_entries(entries))
+    return _coalesce_consecutive_assistants(list(_parse_entries(entries)))
+
+
+def _coalesce_consecutive_assistants(messages: list[object]) -> list[object]:
+    """Merge consecutive ``AssistantMessage`` runs into one logical turn.
+
+    Claude splits one assistant turn across multiple JSONL entries (one
+    per content block); the per-entry parse yields consecutive
+    ``AssistantMessage`` instances. The tape model and the Anthropic wire
+    format both want a single assistant message per turn, so we fuse
+    runs: thinking blocks and tool calls concatenate in order; text
+    blocks join (claude rarely emits more than one text block per turn,
+    but if it does they are continuation fragments).
+    """
+    out: list[object] = []
+    for message in messages:
+        if (
+            isinstance(message, AssistantMessage)
+            and out
+            and isinstance(out[-1], AssistantMessage)
+        ):
+            prev = out[-1]
+            out[-1] = AssistantMessage(
+                text=prev.text + message.text,
+                thinking_blocks=(*prev.thinking_blocks, *message.thinking_blocks),
+                tool_calls=(*prev.tool_calls, *message.tool_calls),
+            )
+        else:
+            out.append(message)
+    return out
 
 
 def _last_compact_boundary_index(entries: list[dict[str, Any]]) -> int:

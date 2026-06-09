@@ -6,7 +6,7 @@ Conventions:
   no API key consulted).
 - All roles get ``preempt_in_flight=True``: TL corrections, peer
   pings, and user redirects fire as SIGINT to the in-flight CLI turn
-  (requires the ``feat/cli-preempt-via-sigint`` patch on the sagent
+  (requires the ``feat/AnthropicCLI`` patch on the sagent
   fork; see ``sagent/README.md``).
 - Peer messaging happens via the plugin's MCP server (``mcp_sagent.server``)
   rather than sagent's bridge-mounted ``AgentSend``. The MCP server's
@@ -294,7 +294,7 @@ def build_agent(
             # ``aborted_streaming`` ``--resume``s the live session
             # (including all assistant turns + tool_use blocks) instead
             # of inheriting a stripped re-feed. See sagent commit on
-            # ``feat/cli-session-resume`` for the full rationale.
+            # the v2 session-persistence arc on ``feat/AnthropicCLI`` (worklog thread v2.1-cli-session-materialize) for the full rationale.
             session_id=_session_id_for(role_name),
             materialize_session=materialize_session,
             subprocess_read_timeout_sec=subprocess_read_timeout_sec,

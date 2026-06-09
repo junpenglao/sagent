@@ -6,7 +6,7 @@ Conventions:
   no API key consulted).
 - All roles get ``preempt_in_flight=True``: TL corrections, peer
   pings, and user redirects fire as SIGINT to the in-flight CLI turn
-  (requires the ``feat/cli-preempt-via-sigint`` patch on the sagent
+  (requires the ``feat/AnthropicCLI`` patch on the sagent
   fork; see ``sagent/README.md``).
 - Peer messaging happens via the plugin's MCP server (``mcp_sagent.server``)
   rather than sagent's bridge-mounted ``AgentSend``. The MCP server's

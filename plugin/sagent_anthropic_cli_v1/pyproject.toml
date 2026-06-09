@@ -8,11 +8,11 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-sagent = { git = "https://github.com/junpenglao/sagent.git", branch = "feat/cli-preempt-via-sigint" }
+sagent = { git = "https://github.com/junpenglao/sagent.git", branch = "feat/AnthropicCLI" }
 
 # When the upstream PR at rekursiv-ai/sagent merges, switch to:
 #   sagent = ">=<NEXT_RELEASE_VERSION>"
-# and archive the feat/cli-preempt-via-sigint branch on the fork.
+# and archive the feat/AnthropicCLI branch on the fork.
 
 [build-system]
 requires = ["setuptools>=61"]

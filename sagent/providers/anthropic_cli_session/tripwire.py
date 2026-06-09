@@ -40,10 +40,12 @@ from pathlib import Path
 from typing import cast
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shutil
+import threading
 import uuid as _uuid
 
 from sagent.providers.anthropic_cli_session.materializer import (
@@ -422,7 +424,9 @@ async def arun_canary_against_live_cli(
     if cwd is None:
         cwd = Path.cwd()
     if home is None:
-        home = Path(os.environ.get("HOME", "~")).expanduser()
+        home = Path(  # noqa: ASYNC240 -- env lookup + string ops, no disk I/O
+            os.environ.get("HOME", "~")
+        ).expanduser()
     return await _run_canary_async(
         session_id=session_id,
         cwd=cwd,
@@ -451,8 +455,6 @@ def _run_canary_from_inside_loop(
     :func:`arun_canary_against_live_cli` directly); this exists for
     tests and ad-hoc sync callers that happen to be inside a loop.
     """
-    import threading
-
     result_container: list[CanaryResult] = []
     error_container: list[BaseException] = []
 
@@ -607,10 +609,8 @@ async def _spawn_canary_claude(
         )
     except TimeoutError:
         proc.kill()
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except TimeoutError:
-            pass
         return [
             DiffFinding(
                 location="<canary>",
@@ -690,14 +690,14 @@ def _check_required_fields(
     i: int, entry: dict[str, object], required: Sequence[str]
 ) -> list[DiffFinding]:
     out: list[DiffFinding] = []
-    for field in required:
-        if field not in entry:
-            out.append(
-                DiffFinding(
-                    location=f"entry[{i}].{field}",
-                    detail=f"required field {field!r} missing from claude entry",
-                )
-            )
+    out.extend(
+        DiffFinding(
+            location=f"entry[{i}].{field}",
+            detail=f"required field {field!r} missing from claude entry",
+        )
+        for field in required
+        if field not in entry
+    )
     return out
 
 
@@ -748,10 +748,8 @@ def _roundtrip_check(
             )
         ]
     finally:
-        try:
+        with contextlib.suppress(OSError):
             mat_path.unlink()
-        except OSError:
-            pass
 
     return structural_diff(original_msgs, roundtripped)
 

@@ -5,23 +5,30 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
+from unittest.mock import AsyncMock, MagicMock
 
 import asyncio
 import inspect
 import json
+import os
 
 import pytest
 
+from sagent.agent.runtime import cli_publish_var
 from sagent.lib.json import MutableJSON
 from sagent.providers import anthropic_cli
 from sagent.providers.anthropic import Anthropic
 from sagent.providers.anthropic_cli import (
     AnthropicCLI,
+    AnthropicCLIRetryableError,
+    _anthropic_subprocess_env,
     _AnthropicCLIModel,
     _build_anthropic_argv,
     _build_model_response,
     _dispatch_stream_event,
+    _extract_retry_after_ms,
     _hash_system,
+    _is_event_retryable,
     _round_context_tokens,
     _serialize_for_stdin,
     _session_jsonl_exists,
@@ -35,8 +42,10 @@ from sagent.providers.lib.subproc import (
 )
 from sagent.types.model import ModelRequest, ModelResponse
 from sagent.types.runtime import (
+    AgentSendMessage,
     AssistantMessage,
     ToolCall,
+    ToolLabel,
     ToolResult,
     UserMessage,
 )
@@ -407,30 +416,32 @@ def test_serialize_for_stdin_rejects_tool_result() -> None:
         )
 
 
-def test_anthropic_subprocess_env_overrides_home_when_tmpdir_set() -> None:
+def test_anthropic_subprocess_env_overrides_home_when_tmpdir_set(
+    tmp_path: Path,
+) -> None:
     """Stateless mode (or session-persistent + per-account): tmpdir
     becomes HOME so the renamed credentials file is found.
     """
-    from sagent.providers.anthropic_cli import _anthropic_subprocess_env
-
-    env = _anthropic_subprocess_env(Path("/tmp/probe"))
-    assert env["HOME"] == "/tmp/probe"
-    assert env["USERPROFILE"] == "/tmp/probe"
+    env = _anthropic_subprocess_env(tmp_path)
+    assert env["HOME"] == str(tmp_path)
+    assert env["USERPROFILE"] == str(tmp_path)
     # Stateless default has CLAUDE_CODE_SKIP_PROMPT_HISTORY set.
     assert env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] == "1"
 
 
-def test_anthropic_subprocess_env_skip_history_off_when_persistent() -> None:
+def test_anthropic_subprocess_env_skip_history_off_when_persistent(
+    tmp_path: Path,
+) -> None:
     """Session-persistent mode keeps the SKIP_PROMPT_HISTORY var unset
     so claude actually writes its session JSONL.
     """
-    from sagent.providers.anthropic_cli import _anthropic_subprocess_env
-
-    env = _anthropic_subprocess_env(Path("/tmp/probe"), persist_session=True)
+    env = _anthropic_subprocess_env(tmp_path, persist_session=True)
     assert "CLAUDE_CODE_SKIP_PROMPT_HISTORY" not in env
 
 
-def test_anthropic_subprocess_env_disables_autocompact_in_materialize_mode() -> None:
+def test_anthropic_subprocess_env_disables_autocompact_in_materialize_mode(
+    tmp_path: Path,
+) -> None:
     """v2.1-α: ``materialize_session=True`` must disable claude's auto-compact.
 
     Rationale: in materialize mode sagent's tape is the source of truth
@@ -443,22 +454,20 @@ def test_anthropic_subprocess_env_disables_autocompact_in_materialize_mode() -> 
     records compactions as ``ContextSplice`` on the tape, which the
     materializer renders as the resolved view).
     """
-    from sagent.providers.anthropic_cli import _anthropic_subprocess_env
-
     # v2 baseline: session-persistent + NOT materialize → auto-compact ENABLED
     env_v2 = _anthropic_subprocess_env(
-        Path("/tmp/probe"), persist_session=True, materialize_session=False
+        tmp_path, persist_session=True, materialize_session=False
     )
     assert "DISABLE_AUTO_COMPACT" not in env_v2
 
     # v2.1-α: session-persistent + materialize → auto-compact DISABLED
     env_v21 = _anthropic_subprocess_env(
-        Path("/tmp/probe"), persist_session=True, materialize_session=True
+        tmp_path, persist_session=True, materialize_session=True
     )
     assert env_v21.get("DISABLE_AUTO_COMPACT") == "1"
 
     # Stateless mode (regardless of materialize flag) always disables
-    env_stateless = _anthropic_subprocess_env(Path("/tmp/probe"), persist_session=False)
+    env_stateless = _anthropic_subprocess_env(tmp_path, persist_session=False)
     assert env_stateless.get("DISABLE_AUTO_COMPACT") == "1"
 
 
@@ -695,8 +704,8 @@ async def test_session_persistent_stream_returns_empty_when_history_cleared(
     # but the provider's counters still think 2 messages were sent.
     request = ModelRequest(
         system="terse",
-        messages=(),
-        tools=(),
+        messages=[],
+        tools=[],
     )
     response = await model.stream(
         request,
@@ -737,11 +746,6 @@ async def test_session_persistent_advances_sent_index_per_entry_on_partial_failu
     appearing 3× in the session JSONL while five subsequent TL STOP
     directives never appeared at all.
     """
-    from unittest.mock import AsyncMock, MagicMock
-
-    from sagent.providers.lib.subproc import SubprocessTransportError
-    from sagent.types.runtime import AgentSendMessage
-
     _write_creds(tmp_path)
     monkeypatch.setattr(
         "sagent.providers.anthropic_cli._CREDS_PATH",
@@ -749,7 +753,7 @@ async def test_session_persistent_advances_sent_index_per_entry_on_partial_failu
     )
     monkeypatch.setattr(
         "sagent.providers.anthropic_cli.shutil.which",
-        lambda name: "/usr/bin/claude",
+        lambda _name: "/usr/bin/claude",
     )
     monkeypatch.setenv("HOME", str(tmp_path))
 
@@ -818,7 +822,7 @@ async def test_session_persistent_advances_sent_index_per_entry_on_partial_failu
     )
     request = ModelRequest(
         system="x",
-        messages=(
+        messages=[
             UserMessage(text="old turn 1"),
             UserMessage(text="old turn 2"),
             UserMessage(text="old turn 3"),
@@ -827,8 +831,8 @@ async def test_session_persistent_advances_sent_index_per_entry_on_partial_failu
             msg_E1,
             msg_E2,
             msg_E3,
-        ),
-        tools=(),
+        ],
+        tools=[],
     )
 
     with pytest.raises(SubprocessTransportError):
@@ -853,8 +857,6 @@ def test_is_event_retryable_classifies_organic_shapes() -> None:
     actual ``is_error: True`` events captured 2026-06-03/04 from the
     multi-agent server.
     """
-    from sagent.providers.anthropic_cli import _is_event_retryable
-
     # 1. The dominant aborted_streaming + ede_diagnostic shape (TL,
     #    2026-06-03 10:17:53 — 418k cache reads attempt that died on
     #    a tool_use boundary). Retryable.
@@ -902,8 +904,6 @@ def test_extract_retry_after_ms_handles_both_key_names() -> None:
     emits a hint (either ``retry_after_ms`` or ``retry_delay_ms``) we
     forward it.
     """
-    from sagent.providers.anthropic_cli import _extract_retry_after_ms
-
     assert _extract_retry_after_ms({"retry_after_ms": 506}) == 506.0
     assert _extract_retry_after_ms({"retry_delay_ms": 1247.5}) == 1247.5
     assert _extract_retry_after_ms({}) is None
@@ -922,8 +922,6 @@ def test_is_retryable_provider_error_session_persistent_only(
     subprocess has already consumed the stdin lines we wrote, so a
     same-call retry would duplicate or stall).
     """
-    from sagent.providers.anthropic_cli import AnthropicCLIRetryableError
-
     _write_creds(tmp_path)
     monkeypatch.setattr(
         "sagent.providers.anthropic_cli._CREDS_PATH",
@@ -1004,16 +1002,12 @@ def test_anthropic_subprocess_env_inherits_real_home_when_tmpdir_none() -> None:
     subprocess inherits the operator's real HOME so native tools (Bash,
     gh, git) find ``~/.config/`` and ``~/.gitconfig``.
     """
-    import os as _os
-
-    from sagent.providers.anthropic_cli import _anthropic_subprocess_env
-
-    operator_home = _os.environ.get("HOME", "")
+    operator_home = os.environ.get("HOME", "")
     env = _anthropic_subprocess_env(None, persist_session=True)
     # HOME comes through unchanged (inherited from os.environ).
     assert env.get("HOME") == operator_home
     # No USERPROFILE override either.
-    if "USERPROFILE" not in _os.environ:
+    if "USERPROFILE" not in os.environ:
         assert "USERPROFILE" not in env
 
 
@@ -1106,9 +1100,6 @@ def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
     """tool_use is published at content_block_stop with name + arg
     summary, after the streamed input_json_delta has been accumulated.
     """
-    from sagent.agent.runtime import cli_publish_var
-    from sagent.types.runtime import ToolLabel
-
     published: list[object] = []
     token = cli_publish_var.set(published.append)
     try:
@@ -1183,8 +1174,6 @@ def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
 
 def test_dispatch_stream_event_no_label_for_text_block_start() -> None:
     """``content_block_start`` for ``text`` does NOT publish a ToolLabel."""
-    from sagent.agent.runtime import cli_publish_var
-
     published: list[object] = []
     token = cli_publish_var.set(published.append)
     try:
@@ -1351,6 +1340,7 @@ def test_should_respawn_triggers() -> None:
 
     # Pretend the hot spare has a live active subprocess; the test only
     # needs ``_active`` to be non-None to exercise the respawn branch.
+    assert model._hot_spare is not None
     model._hot_spare._active = cast(Subproc, _DummyActive())
     user = UserMessage(text="hi")
     request = ModelRequest(messages=[user])

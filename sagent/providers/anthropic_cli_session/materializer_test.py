@@ -288,7 +288,7 @@ def test_compact_boundary_drops_preceding_entries(tmp_home: Path) -> None:
 
     base = {
         "sessionId": sid,
-        "cwd": "/tmp/test",
+        "cwd": "/tmp/test",  # noqa: S108 -- fixture string only, never touches disk
         "gitBranch": "HEAD",
         "version": "test",
         "userType": "external",
@@ -350,7 +350,7 @@ def test_multiple_compact_boundaries_only_last_one_matters(tmp_home: Path) -> No
     path.parent.mkdir(parents=True, exist_ok=True)
     base = {
         "sessionId": sid,
-        "cwd": "/tmp/test",
+        "cwd": "/tmp/test",  # noqa: S108 -- fixture string only, never touches disk
         "gitBranch": "HEAD",
         "version": "test",
         "userType": "external",
@@ -416,7 +416,7 @@ def test_no_compact_boundary_means_no_drop(tmp_home: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     base = {
         "sessionId": sid,
-        "cwd": "/tmp/test",
+        "cwd": "/tmp/test",  # noqa: S108 -- fixture string only, never touches disk
         "gitBranch": "HEAD",
         "version": "test",
         "userType": "external",

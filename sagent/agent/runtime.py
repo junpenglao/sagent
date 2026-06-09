@@ -2050,7 +2050,7 @@ class AgentRuntime:
                                     if callable(cancel):
                                         try:
                                             cancel()
-                                        except Exception:  # noqa: BLE001 -- cancel is best-effort.
+                                        except Exception:
                                             logger.exception(
                                                 "preempt_in_flight: "
                                                 "model.cancel_in_flight() raised",
@@ -2099,7 +2099,7 @@ class AgentRuntime:
                                     if callable(cancel):
                                         try:
                                             cancel()
-                                        except Exception:  # noqa: BLE001 -- cancel is best-effort; do not poison the runtime loop on a provider quirk.
+                                        except Exception:
                                             logger.exception(
                                                 "preempt_in_flight: "
                                                 "model.cancel_in_flight() raised",

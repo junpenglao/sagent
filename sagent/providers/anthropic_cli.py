@@ -329,7 +329,7 @@ class AnthropicCLI(Anthropic):
             mode is intended for chat-channel use cases where
             ``aborted_streaming`` recoveries must NOT lose
             ``AssistantMessage`` content — see
-            ``plugin/blackjax-chat/README.md`` for context.
+            ``examples/blackjax-ai-devs-channel/README.md`` for context.
           materialize_session: v2.1-α — when True (and ``session_id``
             is set), before every ``--resume`` spawn the session JSONL
             is rewritten from sagent's tape view, so claude reads
@@ -1807,8 +1807,10 @@ def _dispatch_stream_event(
         args_summary = _render_tool_args(tool_name, "".join(json_parts))
         label_text = f"{tool_name} {args_summary}".rstrip()
         try:
-            from sagent.agent.runtime import cli_publish_var
-            from sagent.types.runtime import ToolLabel
+            # Lazy: a module-level import would cycle (agent.runtime
+            # transitively imports the providers package).
+            from sagent.agent.runtime import cli_publish_var  # noqa: PLC0415
+            from sagent.types.runtime import ToolLabel  # noqa: PLC0415
 
             publish = cli_publish_var.get()
             if publish is not None:
@@ -1827,6 +1829,7 @@ def _render_tool_args(name: str, raw_json: str) -> str:
     ``content``) get a friendly rendering; unknown tools fall back to
     the raw arg dict.
     """
+    del name  # reserved for future per-tool renderings
     if not raw_json:
         return ""
     try:

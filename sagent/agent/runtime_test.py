@@ -4408,7 +4408,8 @@ class TestUserMessageAlternation:
     def test_coalesce_inbox_false_keeps_messages_discrete(self) -> None:
         """With coalesce_inbox=False, consecutive same-source AgentSends
         stay as distinct history entries separated by a synthetic
-        assistant turn (alternation still satisfied)."""
+        assistant turn (alternation still satisfied).
+        """
         model = ScriptedModel(responses=[])
         agent = agent_runtime.AgentRuntime(model=model, coalesce_inbox=False)
         agent._append_or_coalesce_user(AgentSendMessage(source="A", text="first"))
@@ -4427,7 +4428,8 @@ class TestUserMessageAlternation:
 
     def test_coalesce_inbox_default_true_preserves_legacy_behavior(self) -> None:
         """Default (coalesce_inbox=True) preserves the original merging
-        behaviour so existing sagent users see no change."""
+        behaviour so existing sagent users see no change.
+        """
         model = ScriptedModel(responses=[])
         agent = agent_runtime.AgentRuntime(model=model)  # default coalesce_inbox=True
         agent._append_or_coalesce_user(AgentSendMessage(source="A", text="first"))
@@ -4436,7 +4438,8 @@ class TestUserMessageAlternation:
         assert len(messages) == 1, (
             f"default mode must coalesce; got {len(messages)}: {messages!r}"
         )
-        assert "first" in messages[0].text and "second" in messages[0].text
+        assert "first" in messages[0].text
+        assert "second" in messages[0].text
 
 
 @pytest.mark.asyncio
@@ -7257,7 +7260,7 @@ class _CancellableBlockingModel:
                 # error from the subprocess. In the test the cancel sets
                 # ``self.cancelled``, which we use here to exit early.
                 await asyncio.wait_for(self.cancelled.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pytest.fail("cancel was never observed; preempt branch did not fire")
             raise RuntimeError("simulated provider transport error after SIGINT")
         # Second turn after preempt drains the queued message.

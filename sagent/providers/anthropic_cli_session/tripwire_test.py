@@ -14,12 +14,14 @@ from typing import cast
 
 import json
 import pickle
+import time
 
 import pytest
 
 from sagent.providers.anthropic_cli_session import (
     materialize_session,
     parse_jsonl_to_messages,
+    session_jsonl_path,
 )
 from sagent.providers.anthropic_cli_session.tripwire import (
     DiffFinding,
@@ -209,8 +211,6 @@ def _write_canary_jsonl(
     passes our schema check; ``well_formed=False`` drops the required
     ``message`` field on the user entry to simulate format drift.
     """
-    import time
-
     path.parent.mkdir(parents=True, exist_ok=True)
     base = {
         "sessionId": session_id,
@@ -265,8 +265,6 @@ def test_canary_succeeds_on_well_formed_jsonl(
 
     async def _fake_spawn(**_kwargs: object) -> list[DiffFinding]:
         # Pretend claude ran successfully -- pre-plant the file.
-        from sagent.providers.anthropic_cli_session import session_jsonl_path
-
         path = session_jsonl_path(session_id, cwd=tmp_home, home=tmp_home)
         _write_canary_jsonl(path, session_id)
         return []
@@ -296,8 +294,6 @@ def test_canary_flags_unknown_entry_type(
     what claude expects. Flag at canary time, not in production.
     """
     session_id = "bbbbbbbb-1111-2222-3333-444444444444"
-    from sagent.providers.anthropic_cli_session import session_jsonl_path
-
     path = session_jsonl_path(session_id, cwd=tmp_home, home=tmp_home)
 
     async def _fake_spawn(**_kwargs: object) -> list[DiffFinding]:
@@ -329,8 +325,6 @@ def test_canary_flags_missing_required_field(
 ) -> None:
     """A claude entry missing ``message`` (required for user/assistant) → finding."""
     session_id = "cccccccc-1111-2222-3333-444444444444"
-    from sagent.providers.anthropic_cli_session import session_jsonl_path
-
     path = session_jsonl_path(session_id, cwd=tmp_home, home=tmp_home)
 
     async def _fake_spawn(**_kwargs: object) -> list[DiffFinding]:
@@ -390,8 +384,6 @@ def test_canary_cleanup_removes_jsonl(
     the operator's ``~/.claude/projects/`` directory tidy.
     """
     session_id = "eeeeeeee-1111-2222-3333-444444444444"
-    from sagent.providers.anthropic_cli_session import session_jsonl_path
-
     path = session_jsonl_path(session_id, cwd=tmp_home, home=tmp_home)
 
     async def _fake_spawn(**_kwargs: object) -> list[DiffFinding]:

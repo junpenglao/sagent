@@ -32,14 +32,16 @@ each agent's runtime drains gracefully.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from pathlib import Path
+
 import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
-from pathlib import Path
-from typing import Sequence
 
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -51,7 +53,27 @@ sys.path.insert(0, str(_PLUGIN_DIR))
 # trace files, per-role mcp.json, sentinel, and debug log — useful
 # for end-of-day merges that union this plugin's main.jsonl with the
 # sibling chat/ runtime's main.jsonl in one directory.
+from datetime import UTC
+
+# v2.1-β: imported at module scope (rather than inside
+# ``_run_materializer_tripwire``) so test fixtures can monkeypatch it.
+# When the parent ``sagent`` install is older than the materializer
+# module, the import silently no-ops and the tripwire treats it as
+# "v2 fallback". Operators on older sagent: upgrade to pick up v2.1.
+from typing import Any  # noqa: E402
+
 from mcp_sagent import delivery  # noqa: E402
+
+
+arun_canary_against_live_cli: Any
+try:
+    from sagent.providers.anthropic_cli_session import (
+        arun_canary_against_live_cli as _live_canary,
+    )
+
+    arun_canary_against_live_cli = _live_canary
+except ImportError:
+    arun_canary_against_live_cli = None
 
 
 _DEFAULT_HOST = "127.0.0.1"
@@ -87,10 +109,10 @@ def _build_all_agents():
     from roles.swe import build as build_swe
     from roles.tech_writer import build as build_tw
     from roles.tl import build as build_tl
+    from runtime import trace_writer
+
     from sagent.testing import FakeAgent
     from sagent.tools.core import agent_registry
-
-    from runtime import trace_writer
 
     builders = {
         "tl": build_tl,
@@ -126,6 +148,77 @@ async def _serve_agents_forever(agents):
     return tasks
 
 
+_MATERIALIZER_TRIPWIRE_ENV = "SAGENT_CLI_OWN_SESSION"
+
+
+async def _run_materializer_tripwire() -> None:
+    """v2.1-β startup tripwire for the CLI session materializer.
+
+    Runs only when ``SAGENT_CLI_OWN_SESSION`` is set to a truthy value
+    (``1``/``true``/``yes``, case-insensitive). Spawns a 1-turn canary
+    against ``claude --print``, structurally diffs its JSONL output
+    against what the materializer would have written for the same
+    prompt, and:
+
+    - On clean verdict: keeps the env var set; ``_build_all_agents``
+      will pass ``materialize_session=True`` to every provider.
+    - On drift: clears the env var so the boot falls back to v2
+      CLI-owned mode. The findings are logged at WARNING level so the
+      operator sees the cause and can pin the CLI version or update
+      the materializer.
+
+    Always logs the verdict (one INFO line on success, one WARNING
+    line per finding on drift) so the boot transcript shows whether
+    materialization mode is live for this run.
+    """
+    requested = os.environ.get(_MATERIALIZER_TRIPWIRE_ENV, "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not requested:
+        _LOG.info(
+            "materializer tripwire: %s not set; v2 CLI-owned mode (default)",
+            _MATERIALIZER_TRIPWIRE_ENV,
+        )
+        return
+
+    if arun_canary_against_live_cli is None:
+        _LOG.warning(
+            "materializer tripwire: import unavailable; falling back to v2 mode"
+        )
+        os.environ.pop(_MATERIALIZER_TRIPWIRE_ENV, None)
+        return
+
+    _LOG.info("materializer tripwire: spawning canary against claude --print…")
+    try:
+        result = await arun_canary_against_live_cli()
+    except Exception as exc:  # noqa: BLE001 -- canary must never crash boot
+        _LOG.warning(
+            "materializer tripwire: canary raised %s: %s; falling back to v2 mode",
+            type(exc).__name__,
+            exc,
+        )
+        os.environ.pop(_MATERIALIZER_TRIPWIRE_ENV, None)
+        return
+
+    if result.is_safe:
+        _LOG.info(
+            "materializer tripwire: PASS — sagent will own the session JSONL "
+            "for this boot (%s=1 kept)",
+            _MATERIALIZER_TRIPWIRE_ENV,
+        )
+        return
+
+    _LOG.warning(
+        "materializer tripwire: FAIL — %d finding(s); falling back to v2 mode",
+        len(result.findings),
+    )
+    for finding in result.findings:
+        _LOG.warning("  drift @ %s: %s", finding.location, finding.detail)
+    os.environ.pop(_MATERIALIZER_TRIPWIRE_ENV, None)
+
+
 # --------------------------------------------------------------------------
 # Startup warmup — fire one MCP-tool-call-using turn per agent before
 # accepting user traffic, so the first real user message doesn't hit the
@@ -137,7 +230,7 @@ async def _serve_agents_forever(agents):
 _WARMUP_PROMPT = (
     "BOOTSTRAP PROBE. You MUST call the tool "
     "`mcp__sagent_chat__sagent_self` with arguments "
-    "`{\"status\": \"ready\"}` right now, as your FIRST and ONLY "
+    '`{"status": "ready"}` right now, as your FIRST and ONLY '
     "action in this turn. Do not respond with text in place of the "
     "tool call — describing what you would do does not count and "
     "the bootstrap will be considered failed. After the tool returns "
@@ -205,7 +298,7 @@ async def _warmup_agents(agents, *, timeout_s: float = 90.0) -> dict[str, bool]:
             try:
                 await asyncio.wait_for(idle_events[label].wait(), timeout_s)
                 return label, True
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return label, False
 
         results = await asyncio.gather(*[_wait_one(l) for l in agents])
@@ -329,11 +422,16 @@ def _search_all(q: str, scope: str, limit: int) -> tuple[list[dict], bool]:
         for i, m in enumerate(_read_jsonl(_MAIN_JSONL)):
             body = m.get("body", "") or ""
             if ql in body.lower():
-                results.append({
-                    "source": "message", "idx": i, "ts": m.get("ts", ""),
-                    "from": m.get("from", ""), "to": m.get("to", []),
-                    "snippet": _snippet(body, q),
-                })
+                results.append(
+                    {
+                        "source": "message",
+                        "idx": i,
+                        "ts": m.get("ts", ""),
+                        "from": m.get("from", ""),
+                        "to": m.get("to", []),
+                        "snippet": _snippet(body, q),
+                    }
+                )
                 if len(results) >= limit:
                     return results, True
     if scope in ("traces", "all"):
@@ -341,11 +439,16 @@ def _search_all(q: str, scope: str, limit: int) -> tuple[list[dict], bool]:
             for i, ev in enumerate(_read_jsonl(p)):
                 kind, text = _event_search_text(ev)
                 if ql in text.lower():
-                    results.append({
-                        "source": "trace", "role": role, "idx": i,
-                        "ts": ev.get("_ts", ""), "kind": kind,
-                        "snippet": _snippet(text, q),
-                    })
+                    results.append(
+                        {
+                            "source": "trace",
+                            "role": role,
+                            "idx": i,
+                            "ts": ev.get("_ts", ""),
+                            "kind": kind,
+                            "snippet": _snippet(text, q),
+                        }
+                    )
                     if len(results) >= limit:
                         return results, True
     return results, False
@@ -362,7 +465,7 @@ def _diagnose_agent(label: str, agent) -> dict:
       - stuck  : inbox has queued messages AND no model_call AND no recent activity
       - idle   : model_call None and inbox empty
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     in_flight_call = agent.runtime.model_call is not None
     inbox_pending = 0
@@ -378,10 +481,11 @@ def _diagnose_agent(label: str, agent) -> dict:
         if type(m).__name__ == "AssistantMessage":
             ts = getattr(m, "timestamp", None)
             if isinstance(ts, (int, float)):
-                last_ts_iso = datetime.fromtimestamp(
-                    ts, tz=timezone.utc
-                ).strftime("%Y-%m-%dT%H:%M:%S.") + f"{int((ts % 1) * 1000):03d}Z"
-                age_sec = int(datetime.now(timezone.utc).timestamp() - ts)
+                last_ts_iso = (
+                    datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.")
+                    + f"{int((ts % 1) * 1000):03d}Z"
+                )
+                age_sec = int(datetime.now(UTC).timestamp() - ts)
             break
 
     # Recent trace events (last 6) — sourced from the trace file rather
@@ -396,11 +500,13 @@ def _diagnose_agent(label: str, agent) -> dict:
     recent = []
     for ev in events[-6:]:
         kind, text = _event_search_text(ev)
-        recent.append({
-            "ts": ev.get("_ts", ""),
-            "kind": kind,
-            "summary": text[:200],
-        })
+        recent.append(
+            {
+                "ts": ev.get("_ts", ""),
+                "kind": kind,
+                "summary": text[:200],
+            }
+        )
 
     # Inflight detection: was there a ModelCallStarted with no matching
     # ModelIdle/ModelResponseComplete/ModelResponseError in the recent tail?
@@ -485,11 +591,13 @@ def _diagnose_agent(label: str, agent) -> dict:
         for item in deque_items[:4]:
             text = (getattr(item, "text", "") or "").replace("\n", " ")[:140]
             src = getattr(item, "source", "") or type(item).__name__
-            pending_preview.append({
-                "from": src,
-                "ts": "",
-                "snippet": text,
-            })
+            pending_preview.append(
+                {
+                    "from": src,
+                    "ts": "",
+                    "snippet": text,
+                }
+            )
     except (AttributeError, TypeError):
         pass
 
@@ -541,16 +649,22 @@ def _build_http_app(agents):
       GET  /agents   = /api/agents
       POST /send     = /api/post
     """
+    from mcp_sagent import delivery
     from starlette.applications import Starlette
     from starlette.requests import Request
     from starlette.responses import HTMLResponse, JSONResponse, Response
     from starlette.routing import Route
 
-    from mcp_sagent import delivery
-
     # Static role labels mirror chat/chat:39-42's ``KNOWN_ROLES``.
-    _KNOWN_ROLES = ["user", "tl", "swe", "junior-swe", "statistician",
-                    "tech-writer", "system"]
+    _KNOWN_ROLES = [
+        "user",
+        "tl",
+        "swe",
+        "junior-swe",
+        "statistician",
+        "tech-writer",
+        "system",
+    ]
 
     async def index(_request: Request) -> Response:
         if not _INDEX_HTML_PATH.exists():
@@ -580,10 +694,14 @@ def _build_http_app(agents):
         except ValueError:
             limit = 300
         results, truncated = _search_all(q, scope, limit)
-        return JSONResponse({
-            "q": q, "scope": scope,
-            "results": results, "truncated": truncated,
-        })
+        return JSONResponse(
+            {
+                "q": q,
+                "scope": scope,
+                "results": results,
+                "truncated": truncated,
+            }
+        )
 
     async def restart(request: Request) -> Response:
         # Soft restart: in the single-process model we can't actually kill
@@ -641,10 +759,14 @@ def _build_http_app(agents):
         except Exception as exc:  # noqa: BLE001 -- best-effort soft restart
             notes.append(f"clear() failed: {type(exc).__name__}: {exc}")
             ok = False
-        return JSONResponse({
-            "ok": ok, "role": role, "skip_backlog": skip,
-            "output": "\n".join(notes),
-        })
+        return JSONResponse(
+            {
+                "ok": ok,
+                "role": role,
+                "skip_backlog": skip,
+                "output": "\n".join(notes),
+            }
+        )
 
     def _read_all_records() -> list[dict]:
         if not _MAIN_JSONL.exists():
@@ -682,12 +804,14 @@ def _build_http_app(agents):
                 ctx = 5
             start = max(0, around - ctx)
             end = min(total, around + ctx + 1)
-            return JSONResponse({
-                "records": records[start:end],
-                "offset": start,
-                "total": total,
-                "hit": around,
-            })
+            return JSONResponse(
+                {
+                    "records": records[start:end],
+                    "offset": start,
+                    "total": total,
+                    "hit": around,
+                }
+            )
 
         since = qp.get("since")
         try:
@@ -704,11 +828,11 @@ def _build_http_app(agents):
         # Per-agent liveness, activity, diagnosis, recent trace, inflight
         # tool, and pending-queue preview. Returns the **list** shape that
         # debug.html's render loop iterates over (chat-serve parity).
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         items = [_diagnose_agent(label, agent) for label, agent in agents.items()]
         items.sort(key=lambda d: d["role"])
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         now_iso = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
         return JSONResponse({"agents": items, "now": now_iso})
 
@@ -763,12 +887,14 @@ def _build_http_app(agents):
                 ctx = 14
             start = max(0, around - ctx)
             end = min(total_on_disk, around + ctx + 1)
-            return JSONResponse({
-                "events": events[start:end],
-                "offset": start,
-                "total": total_on_disk,
-                "hit": around,
-            })
+            return JSONResponse(
+                {
+                    "events": events[start:end],
+                    "offset": start,
+                    "total": total_on_disk,
+                    "hit": around,
+                }
+            )
 
         # Default: tail of the last N events. Cap raised from 500
         # → 2000 so a busy multi-hour TL session fits comfortably.
@@ -777,11 +903,13 @@ def _build_http_app(agents):
         except ValueError:
             limit = 2000
         sliced = events[-limit:] if total_on_disk > limit else events
-        return JSONResponse({
-            "events": sliced,
-            "total": total_on_disk,
-            "returned": len(sliced),
-        })
+        return JSONResponse(
+            {
+                "events": sliced,
+                "total": total_on_disk,
+                "returned": len(sliced),
+            }
+        )
 
     async def post(request: Request) -> Response:
         """Operator ingress + cross-process peer routing.
@@ -853,7 +981,9 @@ def _build_http_app(agents):
             if to != "user":
                 target.runtime.inbox.push_back(
                     AgentSendMessage(
-                        source=from_role, text=body, urgent=urgent,
+                        source=from_role,
+                        text=body,
+                        urgent=urgent,
                     ),
                 )
         return JSONResponse({"ok": True, "to": to, "from": from_role})
@@ -923,7 +1053,9 @@ def _build_http_app(agents):
                 to=[to],
                 body=f"[defer +{delay_s}s scheduled] {body}",
             )
-        return JSONResponse({"ok": True, "to": to, "from": from_role, "delay_s": delay_s})
+        return JSONResponse(
+            {"ok": True, "to": to, "from": from_role, "delay_s": delay_s}
+        )
 
     return Starlette(
         debug=False,
@@ -971,6 +1103,16 @@ async def _amain(host: str, port: int) -> int:
     # ``/api/defer``. The MCP server runs in a separate Python
     # process; this env var is the only handshake.
     os.environ["SAGENT_HTTP_PORT"] = str(port)
+
+    # v2.1-β startup tripwire. When the operator has opted into
+    # sagent-owned session JSONLs (``SAGENT_CLI_OWN_SESSION=1``), run
+    # a 1-turn canary through ``claude --print`` first, compare its
+    # JSONL output against what the materializer would have written,
+    # and only KEEP the env flag if the verdict is clean. A drift
+    # finding (unknown entry type, missing required field, structural
+    # round-trip diff) clears the env var so ``_build_all_agents``
+    # falls back to v2 CLI-owned mode for this boot.
+    await _run_materializer_tripwire()
 
     agents = _build_all_agents()
     _LOG.info("brought up %d agents: %s", len(agents), sorted(agents))

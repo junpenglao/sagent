@@ -242,10 +242,10 @@ def _rehydrate_agents_from_jsonl(agents) -> None:
 
     Steps per role agent: ``parse_jsonl_to_messages`` -> repair any dangling
     tool-call pairing (truncated mid-tool writes) -> wrap each message as a
-    ``ReferrableTapeEvent`` -> ``runtime.replay_tape`` -> tell the provider
-    the on-disk JSONL is already synced (``_last_sent_index = len`` so new
-    entries go via stdin, not re-fed; ``_session_initialized = True`` so the
-    next spawn uses ``--resume``).
+    ``ReferrableTapeEvent`` -> ``runtime.replay_tape`` ->
+    ``model.seed_session(len(messages))`` so the provider knows the on-disk
+    JSONL already holds that tape prefix (new entries go via stdin, not
+    re-fed; the next spawn uses ``--resume``).
 
     No-op when materialization is off (``SAGENT_CLI_OWN_SESSION`` opted out),
     where ``claude --resume`` already owns and resumes the on-disk history
@@ -276,10 +276,12 @@ def _rehydrate_agents_from_jsonl(agents) -> None:
         # ``agents`` holds only the 5 real role agents (the ``user`` /
         # ``system`` FakeAgents live in ``agent_registry``, not here), so
         # ``agent.model`` is always the ``_AnthropicCLIModel``. ``model``
-        # is dynamically typed (``Any``) here, which keeps the provider-
-        # private attribute reads/writes below off ty's radar.
+        # is dynamically typed (``Any``) because the generic ``Model``
+        # protocol doesn't carry the session-persistence surface
+        # (``session_id`` / ``seed_session``) — both are public API on
+        # the AnthropicCLI model.
         model: Any = agent.model
-        session_id = getattr(model, "_session_id", "")
+        session_id = getattr(model, "session_id", None)
         if not isinstance(session_id, str) or not session_id:
             continue
         try:
@@ -303,8 +305,7 @@ def _rehydrate_agents_from_jsonl(agents) -> None:
             # Mark the on-disk JSONL as the already-synced prefix so the
             # materializer rewrites it faithfully and new entries go via
             # stdin rather than being re-fed.
-            model._last_sent_index = len(messages)
-            model._session_initialized = True
+            model.seed_session(len(messages))
             _LOG.info(
                 "rehydrate %s: seeded %d messages from %s",
                 label,

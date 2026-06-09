@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 _STDERR_TAIL_LINES = 100
 _TERMINATE_GRACE_SEC = 2.0
 _READ_IDLE_TIMEOUT_SEC = 60.0
+# asyncio.StreamReader's stock per-line buffer (64 KiB). Kept as the
+# default so existing callers see no behaviour change; providers whose
+# wire protocol carries large single-line payloads pass a higher cap.
+_DEFAULT_STREAM_LIMIT = 64 * 1024
 
 
 class SubprocessTransportError(RuntimeError):
@@ -52,6 +56,11 @@ class Subproc:
           for the wrapper to clean.
       cwd: Working directory for the child. ``None`` inherits.
       read_timeout_sec: Maximum idle seconds while waiting for one stdout line.
+      stream_limit: Per-line buffer cap (bytes) for the child's stdout
+          ``asyncio.StreamReader``. Defaults to asyncio's 64 KiB. A line
+          longer than the cap strands ``readline()`` with ``ValueError:
+          Separator is found, but chunk is longer than limit`` — raise it
+          for protocols that put large payloads on a single NDJSON line.
 
     """
 
@@ -63,12 +72,14 @@ class Subproc:
         tmpdir: Path | None = None,
         cwd: Path | None = None,
         read_timeout_sec: float = _READ_IDLE_TIMEOUT_SEC,
+        stream_limit: int = _DEFAULT_STREAM_LIMIT,
     ) -> None:
         self._argv = argv
         self._env = env
         self._tmpdir = tmpdir
         self._cwd = cwd
         self._read_timeout_sec = read_timeout_sec
+        self._stream_limit = stream_limit
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
         self._stderr_task: asyncio.Task[None] | None = None
@@ -82,18 +93,6 @@ class Subproc:
           RuntimeError: If the executable is not on ``PATH``.
 
         """
-        # ``limit`` raises asyncio.StreamReader's per-line buffer above
-        # the default 64 KiB. ``claude --print --output-format stream-json``
-        # emits ONE NDJSON record per content block; a single Read of a
-        # large file echoes the file's content verbatim into one line
-        # (worklog threads of 40+ KiB are routine in our chat use case).
-        # 64 KiB caps stranded ``readline()`` with
-        # "ValueError: Separator is found, but chunk is longer than
-        # limit" -- diagnosed by TL via the live chat 2026-06-03, after
-        # back-to-back reads of chat-to-sagent-migration.md (~41 KiB) +
-        # benchmark-regression-criterion.md (~22 KiB) tripped it. 16 MiB
-        # is comfortably above any single stream-json record we expect
-        # while keeping memory bounded.
         self._proc = await asyncio.create_subprocess_exec(
             *self._argv,
             stdin=asyncio.subprocess.PIPE,
@@ -101,7 +100,7 @@ class Subproc:
             stderr=asyncio.subprocess.PIPE,
             env=self._env,
             cwd=str(self._cwd) if self._cwd is not None else None,
-            limit=16 * 1024 * 1024,
+            limit=self._stream_limit,
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._stderr_task.add_done_callback(

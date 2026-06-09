@@ -362,8 +362,8 @@ parse_jsonl_to_messages(jsonl)
   → repair_dangling_tool_calls(...)         # fix any truncated mid-tool pairing
   → [ReferrableTapeEvent(TapeRef(sid, i), m) for i, m in ...]
   → runtime.replay_tape(records)            # seed the tape
-  → model._last_sent_index = len(messages)  # on-disk prefix is synced
-    model._session_initialized = True        #   → next spawn uses --resume
+  → model.seed_session(len(messages))       # on-disk prefix is synced
+                                            #   → next spawn uses --resume
 ```
 
 A restart then resumes the conversation exactly where it left off —
@@ -380,10 +380,14 @@ and that agent starts fresh).
   cache_creation + cache_read) balloons to millions — dominated by
   cumulative `cache_read`, which is the prompt cache being *read*, not
   missed (the cache is healthy: ~0 misses observed). The compaction gate
-  read that as "context is 5.6M tokens" and fired spuriously. Fix: the
-  CLI model advertises `usage_tokens_are_cumulative=True`, and
-  `Agent.compact_if_needed` sizes context from the resolved message list
-  (`approx_request_tokens`) instead of the cumulative counter.
+  read that as "context is 5.6M tokens" and fired spuriously. Fix:
+  the provider normalizes usage at its boundary — each internal round's
+  `message_start` carries that round's request usage, and the LAST one
+  IS the live context footprint, so `response.tokens`'s input side
+  reports that (direct-API semantics) while `output_tokens` stays
+  cumulative and billing rides `costUSD` untouched. The compaction gate
+  then needs no special-casing at all (it even gains precision: exact
+  server-side counts instead of a client-side estimate).
 - **`signature_delta` dropped.** The stream parser ignored Anthropic's
   `signature_delta`, so `AssistantMessage.thinking_blocks` were unsigned.
   Inert in v2, fatal here (the materializer wrote unsigned thinking and
@@ -721,10 +725,10 @@ gap, and the tape-rehydration design — is recorded in
 [`worklog/threads/v2.1-cli-session-materialize.md`](../../../claude-config/project/worklog/threads/v2.1-cli-session-materialize.md).
 Known follow-ups: a `NoticeMessage` on retry-divergence so a model
 learns to stop chaining `pre-commit && commit` past the subprocess
-timeout (the divergence marker is trace-only today); a live
-`ContextSplice` round-trip check; and removing the temporary
-`compact_trigger_probe` boot log once a few clean boots confirm the
-fix. The `sagent/providers/anthropic_cli_session/` core +
-`usage_tokens_are_cumulative` capability are written to be
-upstream-PR-eligible; the branch is rebased on current `upstream/main`
-to keep that cheap.
+timeout (the divergence marker is trace-only today); and a live
+`ContextSplice` round-trip check. The
+`sagent/providers/anthropic_cli_session/` core + the provider-boundary
+usage normalization are written to be upstream-PR-eligible — the whole
+session slice lives inside `sagent/providers/` by design (see the
+`2026-06-09-sagent-upstream-split` decision doc); the branch is rebased
+on current `upstream/main` to keep that cheap.

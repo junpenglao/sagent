@@ -22,6 +22,7 @@ from sagent.providers.anthropic_cli import (
     _build_model_response,
     _dispatch_stream_event,
     _hash_system,
+    _round_context_tokens,
     _serialize_for_stdin,
     _user_line,
 )
@@ -425,18 +426,166 @@ def test_anthropic_subprocess_env_disables_autocompact_in_materialize_mode() -> 
     assert env_stateless.get("DISABLE_AUTO_COMPACT") == "1"
 
 
-def test_cli_model_reports_cumulative_usage() -> None:
-    """``_AnthropicCLIModel`` advertises cumulative-per-turn usage.
+def test_build_model_response_normalizes_input_to_last_round() -> None:
+    """Input-side tokens report the LAST round's context, not the sum.
 
-    ``claude --print``'s result-event usage sums across the internal tool
-    loop, so the compaction gate must estimate context size from the
-    message list rather than anchoring on the cumulative count. The flag
-    is what ``Agent.compact_if_needed`` reads (via getattr) to make that
-    decision. See the 2026-06-09 SWE 5.6M over-trigger incident.
+    One ``claude --print`` turn = N internal API rounds; the terminal
+    ``result`` usage sums input + cache across ALL of them, over-counting
+    the live context window by ~the round count (live 2026-06-09: a
+    69-round turn summed to 5.6M against a 200k window, spuriously
+    tripping the Agent's proactive compaction gate). The provider must
+    normalize at its boundary so ``response.tokens`` means what the
+    direct-API provider's per-request usage means. Output stays
+    cumulative (it genuinely accumulates) and billing rides ``costUSD``
+    (computed by the CLI from full cumulative usage) untouched.
     """
+    response = _build_model_response(
+        usage_event=cast(
+            MutableJSON,
+            {
+                "type": "result",
+                "modelUsage": {
+                    "claude-opus-4-6": {
+                        "inputTokens": 5_600_000,  # cumulative across rounds
+                        "outputTokens": 450,
+                        "cacheCreationInputTokens": 90_000,
+                        "cacheReadInputTokens": 5_400_000,
+                        "costUSD": 1.25,
+                    }
+                },
+            },
+        ),
+        # Raw Anthropic API shape off the last ``message_start`` —
+        # snake_case, unlike the camelCase ``modelUsage`` rows above.
+        last_round_usage=cast(
+            MutableJSON,
+            {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 1_200,
+                "cache_read_input_tokens": 96_000,
+            },
+        ),
+        text="done",
+        thinking_parts=[],
+        signature_parts=[],
+        stop_reason="end_turn",
+        fallback_message_id="m1",
+    )
+    assert response.tokens.input_tokens == 3
+    assert response.tokens.cache_creation_tokens == 1_200
+    assert response.tokens.cache_read_tokens == 96_000
+    assert response.tokens.output_tokens == 450
+    assert response.total_cost == pytest.approx(1.25)
+
+
+def test_round_context_tokens_sums_cache_pools() -> None:
+    """Context footprint = non-cached input + both cache pools; None → 0."""
+    assert _round_context_tokens(None) == 0
+    assert (
+        _round_context_tokens(
+            cast(
+                MutableJSON,
+                {
+                    "input_tokens": 3,
+                    "cache_creation_input_tokens": 7,
+                    "cache_read_input_tokens": 90,
+                },
+            )
+        )
+        == 100
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_captures_last_round_usage_for_context_anchor() -> None:
+    """End-to-end through ``_drain_until_result``: the LAST round's
+    ``message_start`` usage feeds both ``response.tokens``'s input side
+    and the model's ``_last_input_tokens`` respawn/compaction anchor —
+    while the cumulative ``result`` totals do not.
+    """
+
+    def _msg_start(input_tokens: int, cache_read: int) -> MutableJSON:
+        return cast(
+            MutableJSON,
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {
+                            "input_tokens": input_tokens,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": cache_read,
+                        }
+                    },
+                },
+            },
+        )
+
+    events = [
+        _msg_start(50_000, 0),  # round 1: cold prompt
+        _msg_start(3, 96_000),  # round 2 (final): cached context
+        cast(
+            MutableJSON,
+            {
+                "type": "result",
+                "stop_reason": "end_turn",
+                "is_error": False,
+                "modelUsage": {
+                    "claude-haiku-4-5": {
+                        "inputTokens": 146_003,  # cumulative
+                        "outputTokens": 70,
+                        "cacheReadInputTokens": 96_000,
+                        "costUSD": 0.01,
+                    }
+                },
+            },
+        ),
+    ]
+
+    class _Proc:
+        async def read_json_line(
+            self, *, skip_non_json: bool = False
+        ) -> MutableJSON | None:
+            del skip_non_json
+            return events.pop(0) if events else None
+
     provider = AnthropicCLI()
     model = provider.model("claude-haiku-4-5")
-    assert model.usage_tokens_are_cumulative is True
+    response = await model._drain_until_result(
+        cast(Subproc, _Proc()), on_text=None, on_thinking=None
+    )
+    # Input side = round 2's context footprint, not the 146k sum.
+    assert response.tokens.input_tokens == 3
+    assert response.tokens.cache_read_tokens == 96_000
+    assert response.tokens.output_tokens == 70
+    assert model._last_input_tokens == 96_003
+
+
+def test_seed_session_marks_prefix_synced() -> None:
+    """``seed_session``: the rehydration handshake after ``replay_tape``.
+
+    Declares the on-disk session JSONL already holds the first N tape
+    entries, so the next spawn resumes with ``--resume`` instead of
+    minting a new session, and the prefix is not re-fed via stdin.
+    Public API so host applications (e.g. the blackjax-ai-devs-channel
+    example) never touch provider-private attributes. No-op in
+    stateless mode.
+    """
+    provider = AnthropicCLI()
+    seeded = provider.model(
+        "claude-haiku-4-5",
+        session_id="deadbeef-1234-5678-9abc-deadbeef1234",
+    )
+    assert seeded.session_id == "deadbeef-1234-5678-9abc-deadbeef1234"
+    seeded.seed_session(42)
+    assert seeded._last_sent_index == 42
+    assert seeded._session_initialized is True
+
+    stateless = provider.model("claude-haiku-4-5")
+    assert stateless.session_id is None
+    stateless.seed_session(42)  # no session to seed → no-op
+    assert stateless._last_sent_index == 0
 
 
 def test_model_accepts_subprocess_read_timeout_kwarg() -> None:
@@ -1088,6 +1237,7 @@ def test_build_model_response_sums_model_usage_rows() -> None:
     )
     response = _build_model_response(
         usage_event=usage_event,
+        last_round_usage=None,
         text="reply",
         thinking_parts=["thought"],
         signature_parts=["sig-bytes"],
@@ -1095,7 +1245,10 @@ def test_build_model_response_sums_model_usage_rows() -> None:
         fallback_message_id="fallback",
     )
     assert response.message.text == "reply"
-    assert response.tokens.input_tokens == 300
+    # No ``message_start`` observed → input side is 0 ("unknown — estimate
+    # instead"), NOT the cumulative 300 (see the normalization tests below).
+    assert response.tokens.input_tokens == 0
+    # Output IS cumulative: every internal round's generation was produced.
     assert response.tokens.output_tokens == 60
     assert response.total_cost == pytest.approx(0.0012)
     assert response.stop_reason == "model_finished"
@@ -1123,6 +1276,7 @@ def test_build_model_response_falls_back_to_total_cost_usd() -> None:
     )
     response = _build_model_response(
         usage_event=usage_event,
+        last_round_usage=None,
         text="",
         thinking_parts=[],
         signature_parts=[],

@@ -152,33 +152,41 @@ _MATERIALIZER_TRIPWIRE_ENV = "SAGENT_CLI_OWN_SESSION"
 
 
 async def _run_materializer_tripwire() -> None:
-    """v2.1-β startup tripwire for the CLI session materializer.
+    """Startup tripwire for the CLI session materializer (default-on since
+    v2.1-β graduated 2026-06-09).
 
-    Runs only when ``SAGENT_CLI_OWN_SESSION`` is set to a truthy value
-    (``1``/``true``/``yes``, case-insensitive). Spawns a 1-turn canary
-    against ``claude --print``, structurally diffs its JSONL output
-    against what the materializer would have written for the same
-    prompt, and:
+    Materializer mode is the default: sagent owns the on-disk session
+    JSONL. Operators can opt out by setting
+    ``SAGENT_CLI_OWN_SESSION=0`` (or ``false``/``no``) — that skips
+    the tripwire entirely and ``_build_all_agents`` falls back to v2
+    CLI-owned mode.
 
-    - On clean verdict: keeps the env var set; ``_build_all_agents``
-      will pass ``materialize_session=True`` to every provider.
-    - On drift: clears the env var so the boot falls back to v2
-      CLI-owned mode. The findings are logged at WARNING level so the
-      operator sees the cause and can pin the CLI version or update
-      the materializer.
+    When NOT opted out, the tripwire spawns a 1-turn canary against
+    ``claude --print``, schema-checks claude's JSONL output, runs a
+    structural round-trip diff against what the materializer would
+    have written, and:
+
+    - On clean verdict: leaves the env unchanged (default-on stays
+      on); ``_build_all_agents`` passes ``materialize_session=True``
+      to every provider.
+    - On drift / canary unavailable / canary raised: sets
+      ``SAGENT_CLI_OWN_SESSION=0`` so ``_build_all_agents`` falls
+      back to v2 CLI-owned mode. The findings are logged at WARNING
+      level so the operator sees the cause and can pin the CLI
+      version or update the materializer.
 
     Always logs the verdict (one INFO line on success, one WARNING
     line per finding on drift) so the boot transcript shows whether
     materialization mode is live for this run.
     """
-    requested = os.environ.get(_MATERIALIZER_TRIPWIRE_ENV, "").lower() in (
-        "1",
-        "true",
-        "yes",
+    opt_out = os.environ.get(_MATERIALIZER_TRIPWIRE_ENV, "").lower() in (
+        "0",
+        "false",
+        "no",
     )
-    if not requested:
+    if opt_out:
         _LOG.info(
-            "materializer tripwire: %s not set; v2 CLI-owned mode (default)",
+            "materializer tripwire: %s=0 — v2 CLI-owned mode (operator opt-out)",
             _MATERIALIZER_TRIPWIRE_ENV,
         )
         return
@@ -187,7 +195,7 @@ async def _run_materializer_tripwire() -> None:
         _LOG.warning(
             "materializer tripwire: import unavailable; falling back to v2 mode"
         )
-        os.environ.pop(_MATERIALIZER_TRIPWIRE_ENV, None)
+        os.environ[_MATERIALIZER_TRIPWIRE_ENV] = "0"
         return
 
     _LOG.info("materializer tripwire: spawning canary against claude --print…")
@@ -199,13 +207,13 @@ async def _run_materializer_tripwire() -> None:
             type(exc).__name__,
             exc,
         )
-        os.environ.pop(_MATERIALIZER_TRIPWIRE_ENV, None)
+        os.environ[_MATERIALIZER_TRIPWIRE_ENV] = "0"
         return
 
     if result.is_safe:
         _LOG.info(
             "materializer tripwire: PASS — sagent will own the session JSONL "
-            "for this boot (%s=1 kept)",
+            "for this boot (default-on, %s unset/non-zero)",
             _MATERIALIZER_TRIPWIRE_ENV,
         )
         return
@@ -216,7 +224,7 @@ async def _run_materializer_tripwire() -> None:
     )
     for finding in result.findings:
         _LOG.warning("  drift @ %s: %s", finding.location, finding.detail)
-    os.environ.pop(_MATERIALIZER_TRIPWIRE_ENV, None)
+    os.environ[_MATERIALIZER_TRIPWIRE_ENV] = "0"
 
 
 # --------------------------------------------------------------------------

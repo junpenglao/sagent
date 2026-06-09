@@ -197,29 +197,37 @@ def test_materialize_overwrites_prior_contents(tmp_home: Path) -> None:
     assert b"A" * 500 not in short_bytes
 
 
-def test_env_var_opts_in_via_plugin(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The plugin's ``common.py`` reads ``SAGENT_CLI_OWN_SESSION``.
+def test_env_var_opt_out_semantics_via_plugin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The plugin's ``common.py`` reads ``SAGENT_CLI_OWN_SESSION``
+    with OPT-OUT semantics (default-on since v2.1-β graduated
+    2026-06-09).
 
-    A unit-style smoke check: the env-var truthy-strings parse to
-    True, falsy/missing parse to False. Mirrors the contract the
-    plugin docs the operator against.
+    A unit-style smoke check that mirrors the parsing in
+    ``roles/common.py:build_agent``. Default-on; explicit
+    ``0``/``false``/``no`` opts out.
     """
-    def parse() -> bool:
-        return os.environ.get("SAGENT_CLI_OWN_SESSION", "").lower() in (
-            "1",
-            "true",
-            "yes",
+
+    def materialize_session() -> bool:
+        opt_out = os.environ.get("SAGENT_CLI_OWN_SESSION", "").lower() in (
+            "0",
+            "false",
+            "no",
         )
+        return not opt_out
 
     monkeypatch.delenv("SAGENT_CLI_OWN_SESSION", raising=False)
-    assert parse() is False
+    assert materialize_session() is True, "unset → default-on"
     monkeypatch.setenv("SAGENT_CLI_OWN_SESSION", "")
-    assert parse() is False
+    assert materialize_session() is True, "empty → default-on"
     monkeypatch.setenv("SAGENT_CLI_OWN_SESSION", "0")
-    assert parse() is False
+    assert materialize_session() is False, "explicit 0 → opt-out"
+    monkeypatch.setenv("SAGENT_CLI_OWN_SESSION", "false")
+    assert materialize_session() is False, "false → opt-out"
+    monkeypatch.setenv("SAGENT_CLI_OWN_SESSION", "NO")
+    assert materialize_session() is False, "NO (case-insensitive) → opt-out"
     monkeypatch.setenv("SAGENT_CLI_OWN_SESSION", "1")
-    assert parse() is True
-    monkeypatch.setenv("SAGENT_CLI_OWN_SESSION", "true")
-    assert parse() is True
-    monkeypatch.setenv("SAGENT_CLI_OWN_SESSION", "YES")
-    assert parse() is True
+    assert materialize_session() is True, "legacy truthy → default-on (forward-compat)"
+    monkeypatch.setenv("SAGENT_CLI_OWN_SESSION", "garbage")
+    assert materialize_session() is True, "unknown value → default-on"

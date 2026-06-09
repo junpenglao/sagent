@@ -35,6 +35,7 @@ from sagent.compaction.summary import SummaryCompactor
 # Per-role model assignments mirror ``claude-config/project/.claude/agents/<role>.md``
 # (the existing Claude Code subagent configs).
 MODEL_OPUS = "claude-opus-4-8"
+MODEL_FABLE = "claude-fable-5"
 MODEL_SONNET = "claude-sonnet-4-6"
 MODEL_HAIKU = "claude-haiku-4-5"
 

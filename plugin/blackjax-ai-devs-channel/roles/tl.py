@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .common import MODEL_OPUS, build_agent
+from .common import MODEL_FABLE, build_agent
 
 
 _ROLE_MD = Path(__file__).with_suffix("").with_name("tl.md")
@@ -39,5 +39,5 @@ def build():
             tools.WebSearch(),
             tools.WebFetch(),
         ],
-        model_id=MODEL_OPUS,
+        model_id=MODEL_FABLE,
     )

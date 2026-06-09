@@ -316,6 +316,32 @@ class Anthropic:
     #     400s 'not supported'), readable text. Efforts: opus-4-5
     #     low,medium,high; sonnet-4-5 / haiku-4-5 none.
     KNOWN_MODELS: ClassVar[dict[str, ModelProfile]] = {
+        # fable-5: UNMEASURED placeholder profile mirroring opus-4-8 (the
+        # newest measured generation). Pricing/tokenizer/thinking-mode are
+        # pending live measurement; under the CLI transport none of those
+        # are load-bearing (billing rides the CLI's own costUSD, thinking
+        # knobs are API-transport concerns) -- the operative fields are
+        # max_request_tokens (compaction gate + respawn fraction) and
+        # chars_per_token (estimates). Added 2026-06-09 for the
+        # blackjax-ai-devs-channel TL role swap.
+        "claude-fable-5": ModelProfile(
+            max_request_tokens=200_000,
+            max_response_tokens=128_000,
+            pricing=_OPUS,
+            readable_thinking=False,
+            enabled_thinking_mode=False,
+            valid_efforts=("low", "medium", "high", "xhigh", "max"),
+            chars_per_token=2.83,
+        ),
+        "claude-fable-5+1m": ModelProfile(
+            max_request_tokens=1_000_000,
+            max_response_tokens=128_000,
+            pricing=_OPUS,
+            readable_thinking=False,
+            enabled_thinking_mode=False,
+            valid_efforts=("low", "medium", "high", "xhigh", "max"),
+            chars_per_token=2.83,
+        ),
         "claude-opus-4-8": ModelProfile(
             max_request_tokens=200_000,
             max_response_tokens=128_000,

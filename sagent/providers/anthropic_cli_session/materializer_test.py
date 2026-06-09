@@ -265,11 +265,18 @@ def test_orphan_thinking_block_dropped(tmp_home: Path) -> None:
     assert blocks == [{"type": "text", "text": "ok"}]
 
 
-def test_assistant_ending_in_thinking_gets_padding(tmp_home: Path) -> None:
-    """Anthropic rejects an assistant message whose last block is ``thinking``.
+def test_assistant_ending_in_thinking_is_not_padded(tmp_home: Path) -> None:
+    """Materializer leaves a ``[thinking]``-only entry unpadded.
 
-    The materializer pads with a ``"."`` text block so ``--resume``
-    stays valid. Mirrors ``providers/anthropic.py:_assistant_blocks``.
+    Anthropic's API rejects a wire message whose last block is
+    ``thinking`` — but claude's CLI WRITES exactly that shape into its
+    JSONL (one assistant entry whose content is ``[thinking]`` only).
+    ``--resume`` consumes the unpadded shape; whatever coalescing the
+    CLI does before the next wire send happens internally. Verified
+    against live CLI 2.1.168 output 2026-06-09 by the v2.1-β canary
+    smoke run, which flagged a benign drift caused by our earlier
+    over-defensive ``.`` padding. Pinned here so a future
+    well-intentioned refactor doesn't reintroduce it.
     """
     req = _request(
         AssistantMessage(
@@ -282,9 +289,8 @@ def test_assistant_ending_in_thinking_gets_padding(tmp_home: Path) -> None:
         req, session_id="11111111-cccc-2222-dddd-333333333333", cwd=tmp_home
     )
     blocks = entries[0]["message"]["content"]
-    assert len(blocks) == 2
+    assert len(blocks) == 1
     assert blocks[0]["type"] == "thinking"
-    assert blocks[1] == {"type": "text", "text": "."}
 
 
 def test_atomic_write_replaces_atomically(tmp_path: Path) -> None:

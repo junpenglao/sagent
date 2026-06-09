@@ -2045,7 +2045,9 @@ class AgentRuntime:
                                 # below for the symmetric peer case.
                                 if self._preempt_in_flight and item.urgent:
                                     cancel = getattr(
-                                        self.model, "cancel_in_flight", None,
+                                        self.model,
+                                        "cancel_in_flight",
+                                        None,
                                     )
                                     if callable(cancel):
                                         try:
@@ -2094,7 +2096,9 @@ class AgentRuntime:
                                 # wasted compute.
                                 if self._preempt_in_flight and item.urgent:
                                     cancel = getattr(
-                                        self.model, "cancel_in_flight", None,
+                                        self.model,
+                                        "cancel_in_flight",
+                                        None,
                                     )
                                     if callable(cancel):
                                         try:

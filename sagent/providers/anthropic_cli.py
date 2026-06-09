@@ -36,6 +36,7 @@ from sagent.providers.lib.mcp_bridge import ToolsBridge
 from sagent.providers.lib.oauth import credentials_path
 from sagent.providers.lib.stop_reason import normalize_stop_reason
 from sagent.providers.lib.subproc import (
+    _READ_IDLE_TIMEOUT_SEC,
     Subproc,
     SubprocessTransportError,
 )
@@ -650,6 +651,31 @@ class _AnthropicCLIModel:
         return True
 
     @property
+    def usage_tokens_are_cumulative(self) -> bool:
+        """``True``: ``claude --print`` runs the full tool loop inside one
+        subprocess invocation and the terminal ``result`` event's
+        ``usage``/``modelUsage`` sums input + cache tokens across EVERY
+        internal round.
+
+        So the per-turn input usage over-counts the true single-request
+        context window by ~the number of internal rounds (observed
+        2026-06-09: a 69-round turn reported 5.6M "input" tokens against a
+        200k window). Consumers that size the context window from usage --
+        notably the Agent's proactive compaction trigger
+        (``compact_if_needed``) -- must NOT anchor on this cumulative count;
+        they estimate from the resolved message list instead, the same
+        number the direct-API path uses. Read via ``getattr(model,
+        "usage_tokens_are_cumulative", False)`` so providers that don't
+        define it default to False (per-request usage, trustworthy).
+
+        Cost tracking is unaffected: cumulative IS correct for billing
+        (you pay for every round), so ``response.tokens`` stays cumulative;
+        only the context-SIZE signal is rerouted. See worklog
+        ``v2.1-cli-session-materialize`` § 2026-06-09.
+        """
+        return True
+
+    @property
     def pricing(self) -> Pricing:
         """Per-million-token pricing for the active profile."""
         return self._profile.pricing
@@ -1172,17 +1198,25 @@ class _AnthropicCLIModel:
             # path on first successful drain.
             resume_existing=self._session_initialized,
         )
-        subproc_kwargs: dict[str, object] = {
-            "env": _anthropic_subprocess_env(
-                tmpdir,
-                persist_session=self._session_id is not None,
-                materialize_session=self._materialize_session,
-            ),
-            "tmpdir": spawn_owned_tmpdir,
-        }
-        if self._subprocess_read_timeout_sec is not None:
-            subproc_kwargs["read_timeout_sec"] = self._subprocess_read_timeout_sec
-        proc = Subproc(argv, **subproc_kwargs)  # type: ignore[arg-type]
+        env = _anthropic_subprocess_env(
+            tmpdir,
+            persist_session=self._session_id is not None,
+            materialize_session=self._materialize_session,
+        )
+        # ``None`` defers to ``Subproc``'s own default (60s); an explicit
+        # value (set by the plugin for long pre-commit/ty/JAX tool calls)
+        # overrides it. Pass the resolved value either way.
+        read_timeout = (
+            self._subprocess_read_timeout_sec
+            if self._subprocess_read_timeout_sec is not None
+            else _READ_IDLE_TIMEOUT_SEC
+        )
+        proc = Subproc(
+            argv,
+            env=env,
+            tmpdir=spawn_owned_tmpdir,
+            read_timeout_sec=read_timeout,
+        )
         self._warming_proc = proc
         try:
             await proc.start()

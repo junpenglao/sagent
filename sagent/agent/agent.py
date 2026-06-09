@@ -1870,13 +1870,27 @@ class Agent:
         """
         if self._agent_compactor is None:
             return True
+        # Some providers report ``usage`` tokens that are CUMULATIVE across
+        # an internal tool loop rather than per-request. ``claude --print``
+        # (AnthropicCLI / the CLI-wrapped providers) runs the whole tool
+        # loop inside one subprocess invocation and sums input + cache
+        # tokens across every internal round in the terminal ``result``
+        # event -- so ``_last_input_tokens`` over-counts the true context
+        # window by ~the round count (observed 2026-06-09: a 69-round SWE
+        # turn reported 5.6M "input" tokens against a 200k window, spuriously
+        # tripping compaction). For such providers we must NOT anchor on the
+        # cumulative count; we estimate context size from the message list
+        # instead -- exactly what the direct-API path conceptually does.
+        usage_cumulative = bool(getattr(model, "usage_tokens_are_cumulative", False))
         used = self._last_input_tokens
-        if used <= 0:
-            # No response recorded yet (fresh start or resume): fall back to a
-            # client-side estimate of the request about to be sent. Estimated
-            # against ``live_tools()`` (``BackgroundAwareTool`` wrappers
-            # applied) so the injected ``background`` / ``delay`` schema counts
-            # toward the budget, matching what the next request will carry.
+        if used <= 0 or usage_cumulative:
+            # Either no response recorded yet (fresh start or resume), or the
+            # provider's usage is cumulative-per-turn and untrustworthy as a
+            # context-size signal. Estimate the request about to be sent from
+            # the actual resolved history. Estimated against ``live_tools()``
+            # (``BackgroundAwareTool`` wrappers applied) so the injected
+            # ``background`` / ``delay`` schema counts toward the budget,
+            # matching what the next request will carry.
             used = model.approx_request_tokens(
                 materialize_request(
                     types.model.ModelRequest(
@@ -1901,19 +1915,20 @@ class Agent:
             max_request_tokens=self.max_request_tokens,
             system_tokens=system_tokens,
         )
-        # DIAGNOSTIC (2026-06-09): trace the compaction-trigger inputs to
-        # root-cause the TL over-trigger observed at ~16k tokens against a
-        # 200k window (static math says should_compact must return False
-        # there). Logs the exact inputs on every model call so we can see
-        # whether ``used`` / ``system_tokens`` are mis-estimated or the
-        # threshold formula is wrong. Remove once root-caused.
+        # DIAGNOSTIC (2026-06-09): trace the compaction-trigger inputs.
+        # Root-caused: ``claude --print`` reports CUMULATIVE-per-turn usage,
+        # so ``last_input`` over-counts by ~the internal-round count; the
+        # fix routes cumulative-usage providers through the message-list
+        # estimate (``used`` below is that estimate when cumulative=True).
+        # Probe retained one more boot to confirm the fix holds live; remove
+        # after. ``cumulative`` shows which path produced ``used``.
         logger.info(
             "compact_trigger_probe: agent=%s used=%d last_input=%d "
-            "appended_est=%d system=%d max_request=%d -> compact=%s",
+            "cumulative=%s system=%d max_request=%d -> compact=%s",
             self.name,
             used,
             self._last_input_tokens,
-            (used - self._last_input_tokens) if self._last_input_tokens > 0 else 0,
+            usage_cumulative,
             system_tokens,
             self.max_request_tokens,
             should,

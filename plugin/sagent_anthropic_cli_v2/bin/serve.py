@@ -227,6 +227,99 @@ async def _run_materializer_tripwire() -> None:
     os.environ[_MATERIALIZER_TRIPWIRE_ENV] = "0"
 
 
+def _rehydrate_agents_from_jsonl(agents) -> None:
+    """Seed each agent's tape from its on-disk claude JSONL (materialize-mode
+    resume-from-memory).
+
+    After a ``serve.py`` restart, sagent's in-memory tape is empty (the
+    plugin does not persist sagent's own ``session.jsonl``). In materialize
+    mode that is fatal to continuity: on the second turn the materializer
+    rewrites the on-disk JSONL from the short fresh tape and CLOBBERS the
+    full pre-restart history. To preserve continuity we reconstruct the
+    tape from the claude JSONL itself -- the materializer module ships the
+    inverse parser -- so the resolved view matches the prior conversation
+    and the materializer rewrites it faithfully (no clobber).
+
+    Steps per role agent: ``parse_jsonl_to_messages`` -> repair any dangling
+    tool-call pairing (truncated mid-tool writes) -> wrap each message as a
+    ``ReferrableTapeEvent`` -> ``runtime.replay_tape`` -> tell the provider
+    the on-disk JSONL is already synced (``_last_sent_index = len`` so new
+    entries go via stdin, not re-fed; ``_session_initialized = True`` so the
+    next spawn uses ``--resume``).
+
+    No-op when materialization is off (``SAGENT_CLI_OWN_SESSION`` opted out),
+    where ``claude --resume`` already owns and resumes the on-disk history
+    natively. Best-effort and never crashes boot: a per-agent failure logs a
+    warning and that agent starts fresh.
+    """
+    opt_out = os.environ.get(_MATERIALIZER_TRIPWIRE_ENV, "").lower() in (
+        "0",
+        "false",
+        "no",
+    )
+    if opt_out:
+        _LOG.info("rehydrate: v2 CLI-owned mode — claude --resume owns history")
+        return
+    try:
+        from sagent.agent.session_io import repair_dangling_tool_calls
+        from sagent.providers.anthropic_cli_session import (
+            parse_jsonl_to_messages,
+            session_jsonl_path,
+        )
+        from sagent.types.tape import ReferrableTapeEvent, TapeRef
+    except ImportError as exc:
+        _LOG.warning("rehydrate: import unavailable (%s); agents start fresh", exc)
+        return
+
+    cwd = Path.cwd()
+    for label, agent in agents.items():
+        # ``agents`` holds only the 5 real role agents (the ``user`` /
+        # ``system`` FakeAgents live in ``agent_registry``, not here), so
+        # ``agent.model`` is always the ``_AnthropicCLIModel``. ``model``
+        # is dynamically typed (``Any``) here, which keeps the provider-
+        # private attribute reads/writes below off ty's radar.
+        model: Any = agent.model
+        session_id = getattr(model, "_session_id", "")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        try:
+            path = session_jsonl_path(session_id, cwd=cwd)
+            if not path.exists():
+                _LOG.info("rehydrate %s: no prior JSONL — fresh start", label)
+                continue
+            parsed: list[Any] = list(parse_jsonl_to_messages(path))
+            messages = repair_dangling_tool_calls(parsed)
+            if not messages:
+                _LOG.info("rehydrate %s: JSONL parsed empty — fresh start", label)
+                continue
+            records = [
+                ReferrableTapeEvent(
+                    ref=TapeRef(session_id=session_id, ordinal=i),
+                    event=message,
+                )
+                for i, message in enumerate(messages)
+            ]
+            agent.runtime.replay_tape(records)
+            # Mark the on-disk JSONL as the already-synced prefix so the
+            # materializer rewrites it faithfully and new entries go via
+            # stdin rather than being re-fed.
+            model._last_sent_index = len(messages)
+            model._session_initialized = True
+            _LOG.info(
+                "rehydrate %s: seeded %d messages from %s",
+                label,
+                len(messages),
+                path.name,
+            )
+        except Exception as exc:  # noqa: BLE001 -- rehydration must never crash boot
+            _LOG.warning(
+                "rehydrate %s: failed (%s: %s); agent starts fresh",
+                label,
+                type(exc).__name__,
+                exc,
+            )
+
+
 # --------------------------------------------------------------------------
 # Startup warmup — fire one MCP-tool-call-using turn per agent before
 # accepting user traffic, so the first real user message doesn't hit the
@@ -1124,6 +1217,16 @@ async def _amain(host: str, port: int) -> int:
 
     agents = _build_all_agents()
     _LOG.info("brought up %d agents: %s", len(agents), sorted(agents))
+
+    # Materialize-mode resume-from-memory: seed each agent's tape from its
+    # on-disk claude JSONL BEFORE it starts serving (and before warmup), so
+    # the materializer rewrites the full prior history instead of clobbering
+    # it from a fresh (empty) tape on the second turn after a restart. The
+    # persisted "memory" is the claude JSONL; the materializer's parser
+    # reconstructs the tape from it. No-op in v2 (opt-out) mode, where
+    # ``claude --resume`` owns and resumes the history natively.
+    _rehydrate_agents_from_jsonl(agents)
+
     serve_tasks = await _serve_agents_forever(agents)
 
     # Startup warmup — empirically required for the AnthropicCLI

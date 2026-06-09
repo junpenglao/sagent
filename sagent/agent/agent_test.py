@@ -2781,6 +2781,86 @@ async def test_compact_if_needed_triggers_on_last_response_total() -> None:
 
 
 @pytest.mark.asyncio
+async def test_compact_if_needed_ignores_cumulative_usage_anchor() -> None:
+    """Providers whose usage is cumulative-per-turn must NOT anchor the gate.
+
+    ``claude --print`` sums input + cache tokens across every internal
+    tool-loop round in its terminal ``result`` event, so a heavy turn can
+    report millions of "input" tokens against a 200k window. Anchoring the
+    proactive compaction gate on that count spuriously fires compaction far
+    below the real threshold (live incident 2026-06-09: a 69-round SWE turn
+    reported 5.6M, tripping compaction on a small context).
+
+    Fix: when the model advertises ``usage_tokens_are_cumulative=True``, the
+    gate estimates context size from the resolved message list instead --
+    exactly what the direct-API path conceptually does. Here a tiny history
+    estimates well below threshold, so even a 5.6M cumulative anchor must
+    NOT trigger compaction.
+    """
+
+    class _CumulativeUsageModel(StubModel):
+        @property
+        def usage_tokens_are_cumulative(self) -> bool:
+            return True
+
+        @override
+        def approx_request_tokens(self, request: types.model.ModelRequest) -> int:
+            del request
+            return 5_000  # true context is tiny
+
+    rec = _ThresholdCompactor()
+    a = Agent(
+        model=_CumulativeUsageModel(
+            max_request_tokens=200_000, max_response_tokens=128_000
+        ),
+        tools=[],
+        compactor=rec,
+    )
+    # Simulate the pathological cumulative anchor the CLI would report.
+    a.record_response(
+        types.model.ModelResponse(
+            message=types.runtime.AssistantMessage(text=""),
+            tokens=types.model.TokenCount(input_tokens=5_628_014),
+        )
+    )
+    history: list[types.runtime.ModelContextEvent] = [
+        types.runtime.UserMessage(text="x")
+    ]
+    # The 5.6M anchor would trip the gate if used; the estimate (5k) must
+    # win for cumulative-usage providers -> no compaction.
+    assert await a.compact_if_needed(history, a.model) is True
+    assert rec.compacted is False
+
+
+@pytest.mark.asyncio
+async def test_compact_if_needed_still_anchors_for_per_request_usage() -> None:
+    """Regression guard: per-request providers (default) STILL anchor on the
+    provider count, so the cumulative-usage carve-out doesn't regress the
+    direct-API precision path.
+    """
+    rec = _ThresholdCompactor()
+    a = Agent(
+        model=StubModel(max_request_tokens=200_000, max_response_tokens=128_000),
+        tools=[],
+        compactor=rec,
+    )
+    # StubModel does NOT advertise usage_tokens_are_cumulative -> default
+    # False -> anchor on the provider count. 195k * 1.07125 >= 200k? body
+    # 195k >= threshold ~177k -> compact.
+    a.record_response(
+        types.model.ModelResponse(
+            message=types.runtime.AssistantMessage(text=""),
+            tokens=types.model.TokenCount(input_tokens=195_000),
+        )
+    )
+    history: list[types.runtime.ModelContextEvent] = [
+        types.runtime.AssistantMessage(text="")
+    ]
+    await a.compact_if_needed(history, a.model)
+    assert rec.compacted is True
+
+
+@pytest.mark.asyncio
 async def test_compact_if_needed_adds_tokens_appended_since_last_response() -> None:
     """The gate adds entries appended after the last response to the anchor.
 

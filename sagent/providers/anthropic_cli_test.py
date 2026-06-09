@@ -389,6 +389,20 @@ def test_anthropic_subprocess_env_disables_autocompact_in_materialize_mode() -> 
     assert env_stateless.get("DISABLE_AUTO_COMPACT") == "1"
 
 
+def test_cli_model_reports_cumulative_usage() -> None:
+    """``_AnthropicCLIModel`` advertises cumulative-per-turn usage.
+
+    ``claude --print``'s result-event usage sums across the internal tool
+    loop, so the compaction gate must estimate context size from the
+    message list rather than anchoring on the cumulative count. The flag
+    is what ``Agent.compact_if_needed`` reads (via getattr) to make that
+    decision. See the 2026-06-09 SWE 5.6M over-trigger incident.
+    """
+    provider = AnthropicCLI()
+    model = provider.model("claude-haiku-4-5")
+    assert model.usage_tokens_are_cumulative is True
+
+
 def test_model_accepts_subprocess_read_timeout_kwarg() -> None:
     """``AnthropicCLI.model(subprocess_read_timeout_sec=…)`` plumbs to the model.
 

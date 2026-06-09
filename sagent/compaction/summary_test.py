@@ -40,6 +40,7 @@ from sagent.types.runtime import (
 )
 from sagent.types.tape import (
     ContextSplice,
+    MaskRange,
     ReferrableTapeEvent,
     TapeRecord,
     TapeRef,
@@ -1020,19 +1021,28 @@ def test_drop_orphan_tool_results_keeps_interleaved_sibling_and_result() -> None
 # --- H1: coalesce must not merge across AgentSendMessage sources ----------
 
 
-def test_coalesce_adjacent_users_does_not_merge_cross_source_agent_sends() -> None:
+def test_coalesce_adjacent_users_concats_cross_source_agent_sends() -> None:
+    """Cross-source ``AgentSend(X)+AgentSend(Y)`` concat into a UserMessage.
+
+    Without this, the wire-side role-alternation validator (in
+    ``sagent/types/tape.py:_validate_payload``) raises
+    ``InvalidPayloadError`` on the splice. The structural ``source``
+    field is dropped only in this narrow cross-source case; the wire
+    layer never sent the source to the model anyway (the provider's
+    ``_user_line`` passes only ``entry.text``), so concat-without-prefix
+    matches what the model already sees in the regular flow.
+    """
     out = _coalesce_adjacent_users(
         [
             AgentSendMessage(source="X", text="a"),
             AgentSendMessage(source="Y", text="b"),
         ]
     )
-    assert len(out) == 2
-    first, second = out
-    assert isinstance(first, AgentSendMessage)
-    assert isinstance(second, AgentSendMessage)
-    assert first.source == "X"
-    assert second.source == "Y"
+    assert len(out) == 1
+    only = out[0]
+    assert isinstance(only, UserMessage)
+    assert "a" in only.text
+    assert "b" in only.text
 
 
 def test_coalesce_adjacent_users_merges_same_source_agent_sends() -> None:
@@ -1050,12 +1060,18 @@ def test_coalesce_adjacent_users_merges_same_source_agent_sends() -> None:
     assert "b" in only.text
 
 
-def test_coalesce_adjacent_users_does_not_merge_cross_type() -> None:
-    """User and AgentSend are different sources: never merged, types preserved.
+def test_coalesce_adjacent_users_concats_cross_type_user_and_agent_send() -> None:
+    """Cross-type ``User+AgentSend`` concat into a single ``UserMessage``.
 
-    Codifies the contract behind the (now-removed) cross-type merge branches:
-    ``_same_source`` returns False for cross-type pairs, so they stay distinct
-    and structured attribution is not falsified.
+    Fixes the production wedge observed 2026-06-09 in TL's session:
+    the SummaryCompactor's continuation (UserMessage) ended up adjacent
+    to a kept-recent AgentSendMessage from SWE, the splice failed
+    role-alternation validation, and TL wedged on
+    ``InvalidPayloadError``. The narrow fix is to concat their texts —
+    the wire layer treats both as plain text anyway.
+
+    Both orders must concat (the compactor uses ``direction='from'`` and
+    ``direction='up_to'`` for different fallback shapes).
     """
     out = _coalesce_adjacent_users(
         [
@@ -1063,19 +1079,45 @@ def test_coalesce_adjacent_users_does_not_merge_cross_type() -> None:
             AgentSendMessage(source="X", text="bot"),
         ]
     )
-    assert len(out) == 2
+    assert len(out) == 1
     assert isinstance(out[0], UserMessage)
-    assert isinstance(out[1], AgentSendMessage)
-    # And the reverse order, likewise unmerged.
+    assert "human" in out[0].text
+    assert "bot" in out[0].text
+
     out2 = _coalesce_adjacent_users(
         [
             AgentSendMessage(source="X", text="bot"),
             UserMessage(text="human"),
         ]
     )
-    assert len(out2) == 2
-    assert isinstance(out2[0], AgentSendMessage)
-    assert isinstance(out2[1], UserMessage)
+    assert len(out2) == 1
+    assert isinstance(out2[0], UserMessage)
+    assert "human" in out2[0].text
+    assert "bot" in out2[0].text
+
+
+def test_coalesce_adjacent_users_passes_splice_validator() -> None:
+    """Integration: the coalesced payload must construct a valid ContextSplice.
+
+    Smoke test for the wedge fix — without this, the unit test passes
+    but the system still breaks when the compactor builds the splice
+    and ``_validate_payload`` runs role-alternation checks.
+    """
+    coalesced = _coalesce_adjacent_users(
+        [
+            UserMessage(text="summary continuation"),
+            AgentSendMessage(source="swe", text="Milestone (a) done."),
+        ]
+    )
+    # Must build without raising InvalidPayloadError.
+    splice = ContextSplice(
+        ref=TapeRef(session_id="s", ordinal=10),
+        mask=(MaskRange(session_id="s", lo=0, hi=9),),
+        insert_after=None,
+        payload=coalesced,
+        strategy="summary",
+    )
+    assert len(splice.payload) == 1
 
 
 # --- H6: empty model output must record summary_fallback ------------------

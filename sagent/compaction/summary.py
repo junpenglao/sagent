@@ -753,25 +753,70 @@ def _append_user_guidance(body: str, guidance: str) -> str:
 def _coalesce_adjacent_users(
     payload: Sequence[ModelContextEvent],
 ) -> tuple[ModelContextEvent, ...]:
+    """Merge adjacent user-side entries so the ``ContextSplice`` payload
+    is wire-side valid.
+
+    Two adjacent user-role entries in a ``ContextSplice`` payload
+    violate the role-alternation rule enforced by
+    ``sagent/types/tape.py:_validate_payload`` and splice construction
+    raises ``InvalidPayloadError``. To prevent that:
+
+    - **Same-source** pairs (``User+User`` or ``AgentSend(X)+AgentSend(X)``)
+      merge into a single entry of the same type, preserving the
+      structural source attribution.
+    - **Cross-type** (``User+AgentSend``) and **cross-source**
+      (``AgentSend(X)+AgentSend(Y)``) pairs concatenate their texts into
+      a single :class:`UserMessage`. The structural ``source`` field
+      is dropped in this narrow case — but **the wire layer doesn't
+      send that field to the model anyway** (the provider just passes
+      ``entry.text`` verbatim; see
+      ``providers/anthropic_cli.py:_user_line``), so the model sees
+      the same plain text it would have seen if those messages had
+      arrived as separate turns. No new attribution syntax to confuse
+      the model with.
+
+    ``ToolResult`` is wire-role ``"user"`` but resets the alternation
+    tracker per the validator's contract; adjacency to it does not
+    cause a violation, so we leave the boundary distinct.
+
+    Fixed 2026-06-09 after live SWE/TL compaction-cascade incident
+    (``InvalidPayloadError("payload violates role alternation")``
+    raised when TL compacted a payload that put a synthetic
+    ``UserMessage`` summary continuation adjacent to a freshly-arrived
+    ``AgentSendMessage`` peer reply); see worklog
+    ``v2.1-cli-session-materialize.md`` § 2026-06-09.
+    """
     out: list[ModelContextEvent] = []
     for entry in payload:
         if (
             isinstance(entry, (AgentSendMessage, UserMessage))
             and out
             and wire_role(out[-1]) == "user"
-            and _same_source(out[-1], entry)
+            and isinstance(out[-1], (UserMessage, AgentSendMessage))
         ):
-            # The gate (`_same_source`) only admits same-type pairs:
-            # AgentSend+AgentSend (same source) or User+User. Cross-type
-            # pairs return ``_same_source == False`` and never reach here,
-            # so merging into ``prev`` preserves the (shared) type.
             prev = out[-1]
-            assert isinstance(prev, (UserMessage, AgentSendMessage))
-            out[-1] = dataclasses.replace(
-                prev,
-                text=f"{prev.text}\n\n{entry.text}",
-                attachments=(*prev.attachments, *entry.attachments),
-            )
+            if _same_source(prev, entry):
+                # Same-type, same-source: preserve type, concatenate text.
+                out[-1] = dataclasses.replace(
+                    prev,
+                    text=f"{prev.text}\n\n{entry.text}",
+                    attachments=(*prev.attachments, *entry.attachments),
+                )
+            else:
+                # Cross-type or cross-source: concat texts into a single
+                # UserMessage. The wire layer already passes only
+                # ``entry.text`` to the model for both
+                # ``UserMessage`` and ``AgentSendMessage`` (no
+                # automatic ``[from <source>]:`` prefix), so concat
+                # without attribution matches what the model sees in
+                # the regular (non-compaction) flow. Dropping the
+                # structural ``source`` only here, only on this narrow
+                # cross-source/cross-type fuse path; the dominant
+                # same-source path preserves it.
+                out[-1] = UserMessage(
+                    text=f"{prev.text}\n\n{entry.text}",
+                    attachments=(*prev.attachments, *entry.attachments),
+                )
         else:
             out.append(entry)
     return tuple(out)

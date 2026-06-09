@@ -1,5 +1,5 @@
 [project]
-name = "blackjax-agent-team-sagent"
+name = "blackjax-ai-devs-channel"
 version = "0.0.1"
 description = "Per-role sagent Agent factories for the BlackJAX dev team."
 requires-python = ">=3.12"

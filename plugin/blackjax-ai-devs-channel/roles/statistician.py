@@ -19,7 +19,7 @@ _ROLE_MD = Path(__file__).with_suffix("").with_name("statistician.md")
 def _monorepo_root() -> Path:
     """Find the BlackJAX monorepo root by walking up from this file.
 
-    Layout: ``<root>/<sagent-fork>/plugin/sagent_anthropic_cli_v2/roles/statistician.py``.
+    Layout: ``<root>/<sagent-fork>/plugin/blackjax-ai-devs-channel/roles/statistician.py``.
     Walking up 5 levels lands at the monorepo root (``blackjax-devs/``).
     """
     return Path(__file__).resolve().parents[5]

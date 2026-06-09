@@ -424,7 +424,7 @@ tmux new-session -d -s sagent-chat -n serve \
   -c /home/jp/blackjax-devs \
   'SAGENT_DATA_DIR=/home/jp/blackjax-devs/claude-config/experimental/sagent \
    exec ~/rekursiv/sagent/.venv/bin/python \
-   /home/jp/rekursiv/sagent/plugin/sagent_anthropic_cli_v2/bin/serve.py --port 8767'
+   /home/jp/rekursiv/sagent/plugin/blackjax-ai-devs-channel/bin/serve.py --port 8767'
 ```
 
 Three things this form gets right:
@@ -450,7 +450,7 @@ dir**, so the encoded-cwd JSONL path stays stable across restarts:
 cd /home/jp/blackjax-devs
 SAGENT_DATA_DIR=/home/jp/blackjax-devs/claude-config/experimental/sagent \
   ~/rekursiv/sagent/.venv/bin/python \
-  ~/rekursiv/sagent/plugin/sagent_anthropic_cli_v2/bin/serve.py --port 8767
+  ~/rekursiv/sagent/plugin/blackjax-ai-devs-channel/bin/serve.py --port 8767
 ```
 
 Web UI at `http://127.0.0.1:8767/` — open via SSH tunnel:

@@ -2,7 +2,7 @@
 
 Run from the plugin root:
 
-    python plugin/sagent_anthropic_cli_v2/bin/serve.py [--port 8767] [--host 127.0.0.1]
+    python plugin/blackjax-ai-devs-channel/bin/serve.py [--port 8767] [--host 127.0.0.1]
 
 What this does
 --------------

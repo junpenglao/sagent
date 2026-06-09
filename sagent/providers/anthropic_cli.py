@@ -301,6 +301,7 @@ class AnthropicCLI(Anthropic):
         extra_mcp_servers: dict[str, dict] | None = None,
         session_id: str | None = None,
         materialize_session: bool = False,
+        subprocess_read_timeout_sec: float | None = None,
     ) -> _AnthropicCLIModel:
         """Build a CLI-backed model.
 
@@ -334,6 +335,19 @@ class AnthropicCLI(Anthropic):
             False to preserve v2 behaviour. See
             ``sagent/providers/anthropic_cli_session/`` and the
             ``v2.1-cli-session-materialize`` worklog thread.
+          subprocess_read_timeout_sec: Stdout-idle timeout (seconds)
+            for the ``claude`` subprocess transport. ``None`` keeps
+            the ``Subproc`` default (60s). Set higher when the
+            agent's tools include long-running synchronous Bash
+            commands (e.g. ``pre-commit run --files ...``,
+            ``ty check``, big test suites) that legitimately go
+            silent for >60s while claude awaits the result —
+            without a bump, the transport reads silence as a hang,
+            raises ``SubprocessTransportError``, and
+            ``send_with_retry`` may emit a divergence marker that
+            eats the closing assistant message. Verified live
+            2026-06-09 on SWE's PR3 ``pre-commit + git commit``
+            chain.
 
         Returns:
           model: Backend wrapping a managed ``claude`` subprocess.
@@ -363,6 +377,7 @@ class AnthropicCLI(Anthropic):
             extra_mcp_servers=extra_mcp_servers,
             session_id=session_id,
             materialize_session=materialize_session,
+            subprocess_read_timeout_sec=subprocess_read_timeout_sec,
         )
 
     @override
@@ -402,6 +417,7 @@ class _AnthropicCLIModel:
         extra_mcp_servers: dict[str, dict] | None = None,
         session_id: str | None = None,
         materialize_session: bool = False,
+        subprocess_read_timeout_sec: float | None = None,
     ) -> None:
         self._provider = provider
         self._model_id = model_id
@@ -425,6 +441,17 @@ class _AnthropicCLIModel:
         self._materialize_session: bool = materialize_session and (
             session_id is not None
         )
+        # Stdout-idle timeout (seconds) for the ``claude`` subprocess
+        # transport. ``None`` defers to the ``Subproc`` default (60s).
+        # Bumped to ~3-5min for v2 plugin agents whose tools include
+        # long-running ``pre-commit run`` / ``ty check`` / heavy test
+        # invocations; without the bump, a >60s tool wait makes the
+        # transport read claude's silence as a hang and triggers
+        # ``send_with_retry``, whose retried response often diverges
+        # from the cached partial and eats the closing assistant
+        # message. See worklog ``v2.1-cli-session-materialize`` →
+        # 2026-06-09 SWE PR3 divergence diagnosis.
+        self._subprocess_read_timeout_sec: float | None = subprocess_read_timeout_sec
         # Session-persistence mode (see ``AnthropicCLI.model``'s
         # ``session_id`` arg). When set:
         #   * ``--session-id <uuid>`` is passed on the first turn,
@@ -1145,15 +1172,17 @@ class _AnthropicCLIModel:
             # path on first successful drain.
             resume_existing=self._session_initialized,
         )
-        proc = Subproc(
-            argv,
-            env=_anthropic_subprocess_env(
+        subproc_kwargs: dict[str, object] = {
+            "env": _anthropic_subprocess_env(
                 tmpdir,
                 persist_session=self._session_id is not None,
                 materialize_session=self._materialize_session,
             ),
-            tmpdir=spawn_owned_tmpdir,
-        )
+            "tmpdir": spawn_owned_tmpdir,
+        }
+        if self._subprocess_read_timeout_sec is not None:
+            subproc_kwargs["read_timeout_sec"] = self._subprocess_read_timeout_sec
+        proc = Subproc(argv, **subproc_kwargs)  # type: ignore[arg-type]
         self._warming_proc = proc
         try:
             await proc.start()

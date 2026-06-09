@@ -389,6 +389,27 @@ def test_anthropic_subprocess_env_disables_autocompact_in_materialize_mode() -> 
     assert env_stateless.get("DISABLE_AUTO_COMPACT") == "1"
 
 
+def test_model_accepts_subprocess_read_timeout_kwarg() -> None:
+    """``AnthropicCLI.model(subprocess_read_timeout_sec=…)`` plumbs to the model.
+
+    The v2.1-β.2 lever: bump beyond the 60s Subproc default so
+    long-running synchronous Bash tools (``pre-commit run``, ``ty
+    check``, JAX warmup compiles) don't trip the divergence cascade.
+    Verified live 2026-06-09 on SWE's PR3 ``pre-commit + git commit``
+    chain that was 7-times-eaten by ``send_with_retry`` divergence.
+    """
+    provider = AnthropicCLI()
+    model = provider.model(
+        "claude-haiku-4-5",
+        subprocess_read_timeout_sec=300.0,
+    )
+    assert model._subprocess_read_timeout_sec == 300.0  # type: ignore[attr-defined]
+
+    # Default path: ``None`` defers to ``Subproc``'s own default.
+    default_model = provider.model("claude-haiku-4-5")
+    assert default_model._subprocess_read_timeout_sec is None  # type: ignore[attr-defined]
+
+
 @pytest.mark.asyncio
 async def test_session_persistent_stream_returns_empty_when_history_cleared(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

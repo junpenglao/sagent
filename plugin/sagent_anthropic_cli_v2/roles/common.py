@@ -29,6 +29,8 @@ from pathlib import Path
 
 import os
 
+from sagent.compaction.summary import SummaryCompactor
+
 
 # Per-role model assignments mirror ``claude-config/project/.claude/agents/<role>.md``
 # (the existing Claude Code subagent configs).
@@ -235,6 +237,40 @@ def build_agent(
         "no",
     )
     materialize_session = not opt_out
+
+    # Stdout-idle timeout for the ``claude`` subprocess transport
+    # (Subproc default is 60s). Bumped to 300s to accommodate
+    # long-running synchronous Bash tool calls — e.g. tuningfork's
+    # ``pre-commit run`` (runs ``ty`` over touched files, often
+    # 60-120s), ``uv run python ...`` calibration scripts (JAX
+    # warmup + compilation can be 60+s), heavy test suites. Without
+    # the bump, the transport reads claude's silence during the tool
+    # wait as a hang, raises ``SubprocessTransportError``, sagent's
+    # ``send_with_retry`` retries the model call in-place, and the
+    # retried response diverges from the cached partial — emitting
+    # the divergence marker AND eating the closing assistant message
+    # (the peer ``sagent_send`` back to TL never lands). See worklog
+    # ``v2.1-cli-session-materialize`` § 2026-06-09 for the 7 SWE
+    # divergence diagnosis. 300s is well below opus/sonnet's
+    # 9-10min mid-turn API duration ceiling, so we still catch real
+    # hangs without false-positive timing out on legitimate work.
+    subprocess_read_timeout_sec = 300.0
+
+    # SummaryCompactor wired (v2.1-β.2 graduation, 2026-06-09).
+    # Without a compactor, the agent's tape grows uncapped and the
+    # provider hits the API output-cap / context-window edge for
+    # heavy multi-PR work — observed in production today as SWE's
+    # 3.4M cache_read_input_tokens over a ~5h session, with
+    # increasing ``aborted_streaming`` retryable errors and
+    # eventual stream-cuts. SummaryCompactor's defaults
+    # (``utilization_trigger=0.95``, ``compression=0.075``) fire
+    # compaction at ~95% of the usable window after reserving 7.5%
+    # for the compacted result; the resulting ``ContextSplice``
+    # rides the tape and the materializer renders it on the next
+    # spawn. Replaces claude's auto-compact (which we disabled in
+    # materializer mode to avoid the overwrite-clobber race).
+    compactor = SummaryCompactor()
+
     # NOTE: must not collide with sagent's bridge server name (``"sagent"``,
     # hardcoded at sagent/providers/lib/mcp_bridge.py:175). The bridge
     # exposes Read/Bash/Glob/Grep/etc. as ``mcp__sagent__<tool>``; the
@@ -253,6 +289,7 @@ def build_agent(
             # ``feat/cli-session-resume`` for the full rationale.
             session_id=_session_id_for(role_name),
             materialize_session=materialize_session,
+            subprocess_read_timeout_sec=subprocess_read_timeout_sec,
         ),
         model_spec=_model_spec_for(model_id),
         system=load_system_prompt(role_md_path),
@@ -261,6 +298,7 @@ def build_agent(
         max_tool_call_rounds=max_tool_call_rounds,
         max_budget_usd=max_budget_usd,
         preempt_in_flight=True,
+        compactor=compactor,
         # Each peer ``sagent_send`` call must remain a distinct
         # inbound — see README § "Sagent behaviour overrides".
         coalesce_inbox=False,

@@ -1017,6 +1017,18 @@ class _AnthropicCLIModel:
         """Read stream events until ``result``; assemble a ``ModelResponse``."""
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        # Aggregated thinking-block signature. Anthropic's stream
+        # emits a ``signature_delta`` event alongside ``thinking_delta``;
+        # the final signature is the concatenation of those deltas
+        # (typically a single delta). Required because Anthropic's API
+        # rejects an assistant message with a signature-less thinking
+        # block (HTTP 400 ``thinking.signature: Field required``).
+        # Pre-2026-06-09 this parser ignored signature_delta and v2's
+        # session-persistent path didn't notice — claude owned the
+        # JSONL and never re-sent unsigned thinking blocks via wire.
+        # v2.1-α materialize mode IS the wire-resender, so the
+        # signature became load-bearing.
+        signature_parts: list[str] = []
         # Per-block-index state for tool_use accumulators. Each
         # ``content_block_start`` for a ``tool_use`` registers
         # ``{name, id, json_parts: list[str]}`` keyed by block index;
@@ -1064,6 +1076,7 @@ class _AnthropicCLIModel:
                     cast(MutableJSON, event.get("event") or {}),
                     text_parts,
                     thinking_parts,
+                    signature_parts,
                     tool_use_blocks,
                     on_text,
                     on_thinking,
@@ -1079,6 +1092,7 @@ class _AnthropicCLIModel:
             usage_event=usage_event,
             text="".join(text_parts),
             thinking_parts=thinking_parts,
+            signature_parts=signature_parts,
             stop_reason=stop_reason,
             fallback_message_id=message_id,
         )
@@ -1585,6 +1599,7 @@ def _dispatch_stream_event(
     event: MutableJSON,
     text_parts: list[str],
     thinking_parts: list[str],
+    signature_parts: list[str],
     tool_use_blocks: dict[int, dict[str, object]],
     on_text: Callable[[str], None] | None,
     on_thinking: Callable[[str], None] | None,
@@ -1637,6 +1652,20 @@ def _dispatch_stream_event(
                 thinking_parts.append(text)
                 if on_thinking is not None:
                     on_thinking(text)
+            return
+        if delta_type == "signature_delta":
+            # Per Anthropic's stream-json spec, ``signature_delta``
+            # carries the opaque thought-signature in the ``signature``
+            # field (mirrors ``thinking_delta`` for body text). The
+            # final signature is the concatenation across deltas
+            # (typically a single delta in practice). Required so
+            # downstream wire sends (v2.1-α materializer mode) embed
+            # the signature in the thinking block — Anthropic's API
+            # rejects unsigned thinking with HTTP 400
+            # ``thinking.signature: Field required``.
+            sig = cast(str, delta.get("signature") or "")
+            if sig:
+                signature_parts.append(sig)
             return
         return
     if event_type == "content_block_stop":
@@ -1695,6 +1724,7 @@ def _build_model_response(
     usage_event: MutableJSON,
     text: str,
     thinking_parts: list[str],
+    signature_parts: list[str],
     stop_reason: str | None,
     fallback_message_id: str,
 ) -> ModelResponse:
@@ -1721,11 +1751,20 @@ def _build_model_response(
         raw = usage_event.get("total_cost_usd")
         if isinstance(raw, (int, float)):
             total_cost = float(raw)
-    thinking_blocks = (
-        ({"type": "thinking", "thinking": "".join(thinking_parts)},)
-        if thinking_parts
-        else ()
-    )
+    # Build the single thinking block from the accumulated body + signature.
+    # The signature MUST be present whenever the body is — otherwise a
+    # subsequent wire send rejects with ``thinking.signature: Field required``.
+    # We elide the block entirely if there's no body (no thinking happened).
+    if thinking_parts:
+        thinking_blocks: tuple[dict[str, object], ...] = (
+            {
+                "type": "thinking",
+                "thinking": "".join(thinking_parts),
+                "signature": "".join(signature_parts),
+            },
+        )
+    else:
+        thinking_blocks = ()
     message_id = cast(str, usage_event.get("session_id") or fallback_message_id)
     return ModelResponse(
         message=AssistantMessage(

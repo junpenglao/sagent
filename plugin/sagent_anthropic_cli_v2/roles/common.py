@@ -67,6 +67,13 @@ without actually calling `sagent_send`. Describing the call does \
 not perform it. If you intend to message anyone, call the tool — \
 do not write about it in prose.
 
+**Wrong-tool trap (do not do this):** if a built-in `SendMessage` \
+tool (Claude Teams / Agent-SDK) appears in your catalog, do NOT use \
+it to reach a peer. It routes to a private team registry that is \
+EMPTY here, so the message is silently dropped — the recipient never \
+receives it even though the call looks like it succeeded. Only \
+`mcp__sagent_chat__sagent_send` actually delivers.
+
 **Common success pattern:** call `sagent_send` first (one or more \
 times if you need to message multiple peers, one call each), then \
 optionally end the turn with a brief text content block describing \

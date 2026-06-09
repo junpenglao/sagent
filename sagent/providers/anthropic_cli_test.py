@@ -303,6 +303,42 @@ def test_argv_default_session_id_none_preserves_stateless_flag() -> None:
     assert "--resume" not in argv
 
 
+def test_argv_denies_sendmessage_builtin() -> None:
+    """``SendMessage`` (Claude-Teams built-in) is denied in every mode.
+
+    In session-persistence mode we omit ``--tools`` so the CLI's default
+    allowlist applies -- which includes ``SendMessage``, a tool that
+    routes to Claude Teams' private (here EMPTY) agent registry and
+    silently drops the message. Agents must use
+    ``mcp__sagent_chat__sagent_send`` instead. Regression guard for the
+    2026-06-09 lost-PR-notification bug (SWE reached for ``SendMessage``
+    to tell TL a PR was open; the message vanished).
+    """
+
+    def _denied(argv: list[str]) -> bool:
+        return (
+            "--disallowedTools" in argv
+            and argv[argv.index("--disallowedTools") + 1] == "SendMessage"
+        )
+
+    stateless = _build_anthropic_argv(
+        model_id="claude-sonnet-4-5",
+        system_prompt="be brief",
+        bridge_url="http://127.0.0.1:1234/mcp",
+        bridge_server_name="sagent",
+    )
+    persistent = _build_anthropic_argv(
+        model_id="claude-sonnet-4-5",
+        system_prompt="be brief",
+        bridge_url="http://127.0.0.1:1234/mcp",
+        bridge_server_name="sagent",
+        session_id="deadbeef-1234-5678-9abc-deadbeef1234",
+        resume_existing=True,
+    )
+    assert _denied(stateless)
+    assert _denied(persistent)
+
+
 def test_model_session_id_initialises_session_persistent_mode() -> None:
     """``AnthropicCLI.model(session_id=...)`` flips the mode flag,
     bypasses HotSpare, and starts uninitialised.

@@ -356,6 +356,15 @@ def _assistant_blocks(entry: AssistantMessage) -> list[dict[str, Any]]:
     plain dicts (no Anthropic SDK types). Orphan thinking blocks
     (signature without body) are elided to keep the API happy on a
     later wire send.
+
+    Note on the thinking-end pad: Anthropic's API rejects an assistant
+    *wire* message whose last content block is ``thinking``, but
+    claude's CLI WRITES exactly that shape into its session JSONL
+    (one assistant entry whose content is ``[thinking]`` only,
+    followed by a separate assistant entry for the text). Whatever
+    coalescing it does before the next API call happens internally;
+    ``--resume`` consumes the unpadded shape fine. Verified against
+    live CLI 2.1.168 output 2026-06-09. So we do NOT pad here.
     """
     blocks: list[dict[str, Any]] = [
         dict(tb)
@@ -365,10 +374,6 @@ def _assistant_blocks(entry: AssistantMessage) -> list[dict[str, Any]]:
     if entry.text:
         blocks.append({"type": "text", "text": entry.text})
     blocks.extend(_tool_use_block(tc) for tc in entry.tool_calls)
-    # Anthropic rejects an assistant message whose last block is
-    # ``thinking``; pad with a no-op text so ``--resume`` stays valid.
-    if blocks and blocks[-1].get("type") in ("thinking", "redacted_thinking"):
-        blocks.append({"type": "text", "text": "."})
     return blocks
 
 

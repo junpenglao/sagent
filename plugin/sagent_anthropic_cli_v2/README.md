@@ -1,4 +1,4 @@
-# blackjax-chat (v2 — session-resume CLI)
+# blackjax-chat (v2 — session-resume CLI; v2.1 — sagent-owned JSONL)
 
 A multi-agent chat channel for BlackJAX, built as a plugin on top of
 [sagent](https://github.com/rekursiv-ai/sagent). Five specialised
@@ -11,6 +11,13 @@ This is the **v2** layout. The frozen reference v1 lives at
 `../sagent_anthropic_cli_v1/` and is documented separately;
 the pivot v1 → v2 is summarised below. Install **v2** unless you
 specifically need to inspect v1's `restart_notice` observer.
+
+**v2.1** (default-on as of 2026-06-09) layers a *materializer* on top:
+sagent's tape becomes the canonical history and the session JSONL is
+just resume transport for `claude --print --resume`, with
+sagent-driven compaction and resume-from-memory on restart. See
+[§ v2.1: sagent owns the session JSONL](#v21-sagent-owns-the-session-jsonl-materializer)
+below. Opt out per boot with `SAGENT_CLI_OWN_SESSION=0`.
 
 For the full history of how we got here (the failed `channel/` tmux
 runtime, the structural limits we hit, the external-MCP probe that
@@ -304,6 +311,106 @@ env redirect.
 
 ---
 
+## v2.1: sagent owns the session JSONL (materializer)
+
+v2 lets **claude** own the on-disk session JSONL; sagent reads its
+own tape for state but defers the transcript to claude. v2.1 inverts
+that: **sagent's tape is canonical and the JSONL is just resume
+transport** — the same mental model as direct-API mode, except the
+"messages array" is materialized to a file so `claude --print
+--resume` can read it. Default-on; set `SAGENT_CLI_OWN_SESSION=0`
+(or `false`/`no`) to opt back to v2 CLI-owned mode.
+
+Lives in `sagent/providers/anthropic_cli_session/` (upstream-eligible
+core): `materializer.py` (tape → CLI-shaped NDJSON, deterministic
+UUIDv5 chain, atomic write), `parser.py` (the inverse: JSONL → sagent
+message list), `tripwire.py` (structural drift check + live canary),
+`format_spec.md` (wire format pinned against `claude --version`).
+
+**Before each `--resume` spawn**, the provider rewrites the JSONL from
+`request.messages[:_last_sent_index]` (the resolved tape view), so
+whatever claude appended last turn is superseded by sagent's canonical
+record. New entries still go via stdin (as in v2). This makes sagent
+the single source of truth and lets sagent's own `SummaryCompactor`
+drive compaction (claude's auto-compact is disabled in this mode to
+avoid the materializer clobbering claude's `compact_boundary`).
+
+### Startup tripwire (canary)
+
+On boot, `serve.py` runs a 1-turn `claude --print` canary, schema-checks
+the JSONL claude wrote, and structurally round-trips it through the
+materializer. On any drift it sets `SAGENT_CLI_OWN_SESSION=0` and falls
+back to v2 for that boot — so a CLI-format change can never silently
+corrupt sessions. Boot log on success:
+
+```
+materializer tripwire: PASS — sagent will own the session JSONL for this boot
+```
+
+### Resume-from-memory (tape rehydration)
+
+sagent does **not** persist its own tape across a `serve.py` restart
+(no `session_dir` wired). Naively, in materialize mode that would be
+fatal: on the second post-restart turn the materializer rewrites each
+JSONL from the short fresh tape and **clobbers the full history**. The
+fix is to reconstruct the tape from the JSONL itself — the persisted
+memory — at boot: `_rehydrate_agents_from_jsonl` runs after
+`_build_all_agents` and before warmup, and for each agent:
+
+```
+parse_jsonl_to_messages(jsonl)
+  → repair_dangling_tool_calls(...)         # fix any truncated mid-tool pairing
+  → [ReferrableTapeEvent(TapeRef(sid, i), m) for i, m in ...]
+  → runtime.replay_tape(records)            # seed the tape
+  → model._last_sent_index = len(messages)  # on-disk prefix is synced
+    model._session_initialized = True        #   → next spawn uses --resume
+```
+
+A restart then resumes the conversation exactly where it left off —
+verified live by TL recalling its in-flight PR's commit SHAs after a
+restart. No-op in v2 (opt-out) mode, where `claude --resume` already
+owns the history; per-agent best-effort (a parse failure logs a warning
+and that agent starts fresh).
+
+### Things that bit us (and the fixes)
+
+- **Compaction over-trigger.** `claude --print` reports `usage` tokens
+  that are CUMULATIVE across its internal tool loop (one sagent turn =
+  dozens of internal rounds), so `_last_input_tokens` (= input +
+  cache_creation + cache_read) balloons to millions — dominated by
+  cumulative `cache_read`, which is the prompt cache being *read*, not
+  missed (the cache is healthy: ~0 misses observed). The compaction gate
+  read that as "context is 5.6M tokens" and fired spuriously. Fix: the
+  CLI model advertises `usage_tokens_are_cumulative=True`, and
+  `Agent.compact_if_needed` sizes context from the resolved message list
+  (`approx_request_tokens`) instead of the cumulative counter.
+- **`signature_delta` dropped.** The stream parser ignored Anthropic's
+  `signature_delta`, so `AssistantMessage.thinking_blocks` were unsigned.
+  Inert in v2, fatal here (the materializer wrote unsigned thinking and
+  the API rejected on `--resume` with `400 thinking.signature: Field
+  required`). Fixed by capturing it alongside `thinking_delta`.
+- **Two `role alternation` wedges.** (a) `SummaryCompactor` built a
+  splice whose payload put a summary `UserMessage` adjacent to a kept
+  `AgentSendMessage` — fixed by concatenating cross-type/cross-source
+  adjacent user-side entries. (b) Claude writes ONE assistant turn as
+  MULTIPLE consecutive `assistant` JSONL entries (one per content block);
+  the parser made one `AssistantMessage` each, producing consecutive
+  assistant-role messages that the tape rejects — fixed by coalescing
+  consecutive assistant runs in `parse_jsonl_to_messages`.
+
+### Materialize-mode caveats
+
+- **Disk encoding depends on cwd.** The JSONL path is
+  `~/.claude/projects/-<encoded-cwd>/<uuid>.jsonl` where `<encoded-cwd>`
+  is the spawn cwd. Launch `serve.py` from the monorepo root (`cd
+  /home/jp/blackjax-devs`) so the encoded dir matches across boots;
+  rehydration computes the path from `Path.cwd()`.
+- The provider's `materialize_session` kwarg still defaults to `False`
+  (upstream-eligible signature). The plugin's `build_agent` is the one
+  place that flips the default on for this deployment.
+
+---
+
 ## Running it
 
 Production form used during 2026-06-02 live testing:
@@ -320,17 +427,26 @@ Three things this form gets right:
 
 1. `-c /home/jp/blackjax-devs` sets tmux pane cwd → bash → python →
    `Path.cwd()` at agent construction → each Bash tool's `start_cwd`
-   is the monorepo root, not the plugin source dir.
+   is the monorepo root, not the plugin source dir. **In v2.1
+   (materialize) mode this is load-bearing**: the session JSONL path
+   is `~/.claude/projects/-<encoded-cwd>/<uuid>.jsonl`, and tape
+   rehydration on restart computes that path from `Path.cwd()`. Launch
+   from a different cwd and a restart silently fails to resume (it
+   looks in the wrong encoded dir) — observed 2026-06-09 when a
+   relaunch inherited the sagent-repo cwd from a leading `cd`.
 2. `SAGENT_DATA_DIR=…experimental/sagent` lands audit log + traces
    beside the legacy `channel/main.jsonl` for end-of-day merge.
 3. Absolute path to `serve.py` — relative paths wouldn't resolve with
    `-c` pointing at `~/blackjax-devs`.
 
-Casual local run (no monorepo, no co-location):
+Casual local run — **still `cd` to the monorepo root, not the plugin
+dir**, so the encoded-cwd JSONL path stays stable across restarts:
 
 ```bash
-cd ~/rekursiv/sagent
-uv run python plugin/sagent_anthropic_cli_v2/bin/serve.py --port 8767
+cd /home/jp/blackjax-devs
+SAGENT_DATA_DIR=/home/jp/blackjax-devs/claude-config/experimental/sagent \
+  ~/rekursiv/sagent/.venv/bin/python \
+  ~/rekursiv/sagent/plugin/sagent_anthropic_cli_v2/bin/serve.py --port 8767
 ```
 
 Web UI at `http://127.0.0.1:8767/` — open via SSH tunnel:
@@ -594,3 +710,21 @@ new dependency (the `--session-id` / `--resume` mode of
 production tooling). `channel/` can be shut down in parallel
 whenever ready. The Phase 6 decision file is the remaining
 paperwork.
+
+**v2.1 (materializer)** is default-on and has been live-validated:
+sagent owns the session JSONL, the startup canary tripwire guards
+against CLI-format drift, and restart resume-from-memory is proven
+(TL recalled in-flight PR commit SHAs after a restart). The deep
+debugging arc that hardened it — the cumulative-cache-read compaction
+over-trigger, two `role alternation` wedges, the `signature_delta`
+gap, and the tape-rehydration design — is recorded in
+[`worklog/threads/v2.1-cli-session-materialize.md`](../../../claude-config/project/worklog/threads/v2.1-cli-session-materialize.md).
+Known follow-ups: a `NoticeMessage` on retry-divergence so a model
+learns to stop chaining `pre-commit && commit` past the subprocess
+timeout (the divergence marker is trace-only today); a live
+`ContextSplice` round-trip check; and removing the temporary
+`compact_trigger_probe` boot log once a few clean boots confirm the
+fix. The `sagent/providers/anthropic_cli_session/` core +
+`usage_tokens_are_cumulative` capability are written to be
+upstream-PR-eligible; the branch is rebased on current `upstream/main`
+to keep that cheap.

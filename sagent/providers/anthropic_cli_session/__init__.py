@@ -22,18 +22,24 @@ from sagent.providers.anthropic_cli_session.parser import (
     parse_jsonl_to_messages,
 )
 from sagent.providers.anthropic_cli_session.tripwire import (
+    CanaryResult,
     DiffFinding,
+    arun_canary_against_live_cli,
     is_safe_to_enable,
+    run_canary_against_live_cli,
     structural_diff,
 )
 
 
 __all__ = [
+    "CanaryResult",
     "DiffFinding",
+    "arun_canary_against_live_cli",
     "is_safe_to_enable",
     "iter_jsonl",
     "materialize_session",
     "parse_jsonl_to_messages",
+    "run_canary_against_live_cli",
     "session_jsonl_path",
     "structural_diff",
 ]

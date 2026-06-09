@@ -10,12 +10,13 @@ Two entry points:
   ``DiffFinding`` entries; an empty list means "no drift, safe to
   enable materialization".
 
-- :func:`run_canary_against_live_cli` — placeholder for the v2.1-β
-  startup probe that spawns a real ``claude --print`` against a
-  hard-coded ``"ping"`` prompt, reads the JSONL claude writes, runs
-  the same prompt through the materializer, and reports the diff
-  verdict. Not wired into ``serve.py`` yet (the production wiring
-  is the v2.1-β gate per the worklog proposal).
+- :func:`run_canary_against_live_cli` / :func:`arun_canary_against_live_cli`
+  — the v2.1-β startup probe. Spawns a 1-turn ``claude --print``
+  against a fresh canary session, schema-checks every JSONL entry
+  claude wrote, round-trips it through the materializer, and reports
+  a :class:`CanaryResult` with ``is_safe`` + findings. ``serve.py``
+  calls the async variant before agent build-up and clears
+  ``SAGENT_CLI_OWN_SESSION`` if the verdict is dirty.
 
 The diff is structural, not byte-level — claude splits each content
 block into its own JSONL entry (thinking → own line, then tool_use
@@ -36,16 +37,75 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
+import asyncio
+import json
+import logging
+import os
+import shutil
+import uuid as _uuid
+
+from sagent.providers.anthropic_cli_session.materializer import (
+    materialize_session,
+    session_jsonl_path,
+)
 from sagent.providers.anthropic_cli_session.parser import (
+    iter_jsonl,
     parse_jsonl_to_messages,
 )
+from sagent.types.model import ModelContextEvent, ModelRequest
 from sagent.types.runtime import (
     AssistantMessage,
     ToolCall,
     ToolResult,
     UserMessage,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+# Schema check: every chain-bearing entry must carry these fields.
+# Pinned against CLI 2.1.168 -- see format_spec.md. Missing fields
+# would make ``--resume`` reject the file or render an unparseable
+# entry, so we flag them as drift.
+_REQUIRED_FIELDS_CHAIN = ("type", "uuid", "timestamp", "sessionId", "version")
+_REQUIRED_FIELDS_USER = ("message",)
+_REQUIRED_FIELDS_ASSISTANT = ("message", "requestId")
+
+
+# Entry types we accept on a claude-written canary JSONL. Anything
+# else is an unrecognized type and signals format drift -- the
+# materializer + parser will either drop it (lossy round-trip) or
+# silently produce wrong output downstream.
+_KNOWN_ENTRY_TYPES = frozenset(
+    {
+        # Chain-bearing
+        "user",
+        "assistant",
+        "summary",
+        # Sidecar (parser drops these; format_spec.md documents them)
+        "system",
+        "attachment",
+        "custom-title",
+        "agent-name",
+        "mode",
+        "permission-mode",
+        "last-prompt",
+        "file-history-snapshot",
+        "queue-operation",
+        "ai-title",
+        "agent-setting",
+    }
+)
+
+
+# Default canary timeout. A real ``claude --print`` "ping" round-trip
+# typically completes in 2-5 seconds against haiku; 30s gives generous
+# headroom for cold-cache + first-load. Slower than this means the
+# CLI is in trouble and the operator should know.
+_DEFAULT_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -235,31 +295,475 @@ def _compare_tool_result(i: int, a: ToolResult, b: ToolResult) -> list[DiffFindi
 
 
 # ---------------------------------------------------------------------------
-# Live canary runner (stub for v2.1-β)
+# Live canary runner
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CanaryResult:
+    """Verdict + diagnostics from one canary run.
+
+    ``is_safe`` is the gate the boot path checks before flipping
+    ``SAGENT_CLI_OWN_SESSION=1`` for the rest of the process. The
+    findings list explains why if it's False; the operator log shows
+    them verbatim.
+    """
+
+    is_safe: bool
+    findings: list[DiffFinding]
+    claude_jsonl_path: Path | None
+    """Where claude wrote the canary session, before cleanup."""
 
 
 def run_canary_against_live_cli(
     *,
+    session_id: str | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+    model: str = "claude-haiku-4-5",
+    prompt: str = "ping",
+    timeout_s: float = _DEFAULT_TIMEOUT_S,
+    cleanup: bool = True,
+) -> CanaryResult:
+    """Run a 1-turn canary through ``claude --print`` and verdict the JSONL.
+
+    Steps:
+
+    1. Mint a fresh canary session UUID (never collides with a real
+       role's session).
+    2. Spawn ``claude --print --input-format stream-json
+       --session-id <uuid>`` with a tiny prompt.
+    3. Read the JSONL claude wrote to
+       ``<home>/.claude/projects/-<encoded-cwd>/<uuid>.jsonl``.
+    4. Schema-check: every entry's ``type`` is in
+       :data:`_KNOWN_ENTRY_TYPES`, every chain-bearing entry has the
+       required fields.
+    5. Round-trip check: parse claude's JSONL → re-materialize → reparse
+       → ``structural_diff`` vs the parsed original. Catches lossy
+       mappings.
+    6. Cleanup: delete the canary JSONL (unless ``cleanup=False``).
+
+    Returns a :class:`CanaryResult` with the verdict + findings + path.
+    The boot path treats ``not result.is_safe`` as "do not flip
+    ``materialize_session=True`` for this boot".
+
+    Failure modes that map to ``is_safe=False`` rather than raising:
+
+    - ``claude`` CLI not on PATH
+    - Subprocess timeout
+    - Subprocess non-zero exit
+    - Empty / missing JSONL after the spawn
+    - Any of the above happens silently; one finding per failure.
+
+    Errors that DO raise: programming bugs (TypeError, ValueError on
+    bad args). I/O errors during cleanup are swallowed.
+    """
+    if session_id is None:
+        # Use a fresh UUIDv4 so the canary session is guaranteed not
+        # to collide with any real role's UUIDv5-derived session.
+        session_id = str(_uuid.uuid4())
+    if cwd is None:
+        cwd = Path.cwd()
+    if home is None:
+        home = Path(os.environ.get("HOME", "~")).expanduser()
+
+    # Pick the right entry depending on whether we're already inside
+    # an event loop. The boot path calls ``await
+    # arun_canary_against_live_cli(...)`` directly so it never gets
+    # here in production; this sync entry exists for tests and ad-hoc
+    # use.
+    try:
+        return asyncio.run(
+            _run_canary_async(
+                session_id=session_id,
+                cwd=cwd,
+                home=home,
+                model=model,
+                prompt=prompt,
+                timeout_s=timeout_s,
+                cleanup=cleanup,
+            )
+        )
+    except RuntimeError as exc:
+        # ``asyncio.run`` refuses to nest. Fall back to a thread that
+        # owns its own loop.
+        if "already running" in str(exc).lower():
+            return _run_canary_from_inside_loop(
+                session_id=session_id,
+                cwd=cwd,
+                home=home,
+                model=model,
+                prompt=prompt,
+                timeout_s=timeout_s,
+                cleanup=cleanup,
+            )
+        raise
+
+
+async def arun_canary_against_live_cli(
+    *,
+    session_id: str | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+    model: str = "claude-haiku-4-5",
+    prompt: str = "ping",
+    timeout_s: float = _DEFAULT_TIMEOUT_S,
+    cleanup: bool = True,
+) -> CanaryResult:
+    """Async entry for callers already inside an event loop.
+
+    Same behaviour as :func:`run_canary_against_live_cli`, awaited
+    directly instead of bouncing through ``asyncio.run``. Use this
+    from ``serve.py:_amain`` (which is already async) to avoid the
+    thread-fallback path.
+    """
+    if session_id is None:
+        session_id = str(_uuid.uuid4())
+    if cwd is None:
+        cwd = Path.cwd()
+    if home is None:
+        home = Path(os.environ.get("HOME", "~")).expanduser()
+    return await _run_canary_async(
+        session_id=session_id,
+        cwd=cwd,
+        home=home,
+        model=model,
+        prompt=prompt,
+        timeout_s=timeout_s,
+        cleanup=cleanup,
+    )
+
+
+def _run_canary_from_inside_loop(
+    *,
     session_id: str,
     cwd: Path,
-    home: Path | None = None,
-) -> tuple[bool, list[DiffFinding]]:
-    """Stub for the v2.1-β startup canary.
+    home: Path,
+    model: str,
+    prompt: str,
+    timeout_s: float,
+    cleanup: bool,
+) -> CanaryResult:
+    """Fallback for callers that already own an event loop.
 
-    The plan is: spawn ``claude --print`` against a fixed ``"ping"``
-    prompt, capture the JSONL claude writes to disk, run the same
-    prompt through the materializer, structural-diff the two, return
-    ``(is_safe, findings)``.
-
-    NotImplementedError today because the live-spawn path requires
-    credentials + a subprocess + a way to clean up the canary
-    session, which is out of scope for v2.1-α (Phases 1 & 2). The
-    boot path can call this stub and treat the NotImplementedError
-    as "tripwire unavailable; default to materialization-off" until
-    v2.1-β lands it.
+    Spins up a thread to run the canary in its own loop. The boot
+    path doesn't use this (it calls
+    :func:`arun_canary_against_live_cli` directly); this exists for
+    tests and ad-hoc sync callers that happen to be inside a loop.
     """
-    raise NotImplementedError(
-        "v2.1-β canary live spawn not implemented; use structural_diff() "
-        "with a pre-captured pair of JSONL files for now",
+    import threading
+
+    result_container: list[CanaryResult] = []
+    error_container: list[BaseException] = []
+
+    def _runner() -> None:
+        try:
+            result_container.append(
+                asyncio.run(
+                    _run_canary_async(
+                        session_id=session_id,
+                        cwd=cwd,
+                        home=home,
+                        model=model,
+                        prompt=prompt,
+                        timeout_s=timeout_s,
+                        cleanup=cleanup,
+                    )
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 -- propagate to main thread
+            error_container.append(exc)
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if error_container:
+        raise error_container[0]
+    return result_container[0]
+
+
+async def _run_canary_async(
+    *,
+    session_id: str,
+    cwd: Path,
+    home: Path,
+    model: str,
+    prompt: str,
+    timeout_s: float,
+    cleanup: bool,
+) -> CanaryResult:
+    """The actual async canary body. Factored so sync entry can wrap."""
+    expected_path = session_jsonl_path(session_id, cwd=cwd, home=home)
+
+    # Spawn claude
+    spawn_findings = await _spawn_canary_claude(
+        session_id=session_id,
+        cwd=cwd,
+        model=model,
+        prompt=prompt,
+        timeout_s=timeout_s,
     )
+    if spawn_findings:
+        return CanaryResult(
+            is_safe=False, findings=spawn_findings, claude_jsonl_path=None
+        )
+
+    # Read what claude wrote
+    if not expected_path.exists():
+        return CanaryResult(
+            is_safe=False,
+            findings=[
+                DiffFinding(
+                    location="<canary>",
+                    detail=f"claude --print did not write {expected_path}",
+                )
+            ],
+            claude_jsonl_path=None,
+        )
+
+    schema_findings = _schema_check(expected_path)
+    roundtrip_findings = _roundtrip_check(
+        expected_path,
+        session_id=session_id,
+        cwd=cwd,
+        home=home,
+    )
+
+    if cleanup:
+        _cleanup_canary_files(expected_path)
+
+    all_findings = schema_findings + roundtrip_findings
+    return CanaryResult(
+        is_safe=is_safe_to_enable(all_findings),
+        findings=all_findings,
+        claude_jsonl_path=expected_path,
+    )
+
+
+async def _spawn_canary_claude(
+    *,
+    session_id: str,
+    cwd: Path,
+    model: str,
+    prompt: str,
+    timeout_s: float,
+) -> list[DiffFinding]:
+    """Spawn ``claude --print`` with the canary prompt. Returns findings on failure."""
+    if shutil.which("claude") is None:
+        return [
+            DiffFinding(
+                location="<canary>",
+                detail="`claude` CLI is not on PATH; cannot run canary",
+            )
+        ]
+
+    argv = [
+        "claude",
+        "--print",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        model,
+        "--system-prompt",
+        "You are a canary probe. Reply with one short word.",
+        "--session-id",
+        session_id,
+        "--setting-sources",
+        "",
+        "--disable-slash-commands",
+        "--permission-mode",
+        "bypassPermissions",
+    ]
+    stdin_payload = (
+        json.dumps(
+            {"type": "user", "message": {"role": "user", "content": prompt}},
+        )
+        + "\n"
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(cwd),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except (OSError, ValueError) as exc:
+        return [
+            DiffFinding(
+                location="<canary>",
+                detail=f"failed to spawn claude subprocess: {exc}",
+            )
+        ]
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(input=stdin_payload.encode("utf-8")),
+            timeout=timeout_s,
+        )
+    except TimeoutError:
+        proc.kill()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except TimeoutError:
+            pass
+        return [
+            DiffFinding(
+                location="<canary>",
+                detail=(
+                    f"claude --print canary timed out after {timeout_s}s; "
+                    "tripwire treats this as drift"
+                ),
+            )
+        ]
+
+    if proc.returncode != 0:
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:500]
+        return [
+            DiffFinding(
+                location="<canary>",
+                detail=(f"claude --print exited {proc.returncode}: {stderr_text!r}"),
+            )
+        ]
+
+    # stdout is the stream-json output we don't actually parse here --
+    # we read the on-disk JSONL instead. Discard.
+    _ = stdout_bytes
+    return []
+
+
+def _schema_check(path: Path) -> list[DiffFinding]:
+    """Validate every JSONL entry against the pinned schema.
+
+    Two checks per entry:
+
+    1. Its ``type`` is in :data:`_KNOWN_ENTRY_TYPES`. An unknown
+       type means the CLI added a new entry shape our parser will
+       silently drop or our materializer can't reproduce.
+    2. Chain-bearing entries (``user``, ``assistant``) carry the
+       required fields. Missing fields would make ``--resume`` reject
+       the file (claude's own loader is strict about ``parentUuid``
+       and ``message`` shape).
+    """
+    findings: list[DiffFinding] = []
+    try:
+        entries = list(iter_jsonl(path))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [
+            DiffFinding(
+                location="<canary>",
+                detail=f"failed to read/parse claude JSONL at {path}: {exc}",
+            )
+        ]
+
+    for i, entry in enumerate(entries):
+        t = entry.get("type")
+        if t not in _KNOWN_ENTRY_TYPES:
+            findings.append(
+                DiffFinding(
+                    location=f"entry[{i}].type",
+                    detail=(
+                        f"unknown entry type {t!r}; CLI may have added a new "
+                        "shape we don't materialize"
+                    ),
+                )
+            )
+            continue
+        if t == "user":
+            findings.extend(_check_required_fields(i, entry, _REQUIRED_FIELDS_USER))
+        elif t == "assistant":
+            findings.extend(
+                _check_required_fields(i, entry, _REQUIRED_FIELDS_ASSISTANT)
+            )
+        # Chain fields apply to ``user`` / ``assistant`` / ``summary``;
+        # sidecars don't carry them and that's expected.
+        if t in ("user", "assistant", "summary"):
+            findings.extend(_check_required_fields(i, entry, _REQUIRED_FIELDS_CHAIN))
+    return findings
+
+
+def _check_required_fields(
+    i: int, entry: dict[str, object], required: Sequence[str]
+) -> list[DiffFinding]:
+    out: list[DiffFinding] = []
+    for field in required:
+        if field not in entry:
+            out.append(
+                DiffFinding(
+                    location=f"entry[{i}].{field}",
+                    detail=f"required field {field!r} missing from claude entry",
+                )
+            )
+    return out
+
+
+def _roundtrip_check(
+    claude_path: Path,
+    *,
+    session_id: str,
+    cwd: Path,
+    home: Path,
+) -> list[DiffFinding]:
+    """Parse claude's JSONL, re-materialize, reparse, structural_diff."""
+    try:
+        original_msgs = parse_jsonl_to_messages(claude_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return [
+            DiffFinding(
+                location="<canary>",
+                detail=f"failed to parse claude JSONL: {exc}",
+            )
+        ]
+
+    # Materialize to a temp session id under the same home so the path
+    # is computed identically. We use a "-canary-mat" suffix on the
+    # session id to keep claude's canary file and ours from colliding.
+    mat_session_id = f"{session_id}-canary-mat"
+    try:
+        mat_path, _ = materialize_session(
+            ModelRequest(messages=cast(list[ModelContextEvent], original_msgs)),
+            session_id=mat_session_id,
+            cwd=cwd,
+            home=home,
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        return [
+            DiffFinding(
+                location="<canary>",
+                detail=f"materializer raised on claude-parsed messages: {exc}",
+            )
+        ]
+
+    try:
+        roundtripped = parse_jsonl_to_messages(mat_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return [
+            DiffFinding(
+                location="<canary>",
+                detail=f"failed to reparse materialized canary: {exc}",
+            )
+        ]
+    finally:
+        try:
+            mat_path.unlink()
+        except OSError:
+            pass
+
+    return structural_diff(original_msgs, roundtripped)
+
+
+def _cleanup_canary_files(claude_path: Path) -> None:
+    """Best-effort: remove the canary session JSONL.
+
+    Failure is silent because we don't want a transient OSError on
+    boot to mask the verdict. The next canary will overwrite via the
+    materializer's atomic write anyway (or land on a different UUID).
+    """
+    try:
+        claude_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("canary cleanup: failed to delete %s: %s", claude_path, exc)

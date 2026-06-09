@@ -220,17 +220,21 @@ def build_agent(
     from sagent.agent import Agent
 
     provider = build_provider()
-    # v2.1-α opt-in: when ``SAGENT_CLI_OWN_SESSION=1``, sagent rewrites
-    # the on-disk session JSONL from its tape view before every
-    # ``--resume`` spawn (instead of trusting whatever claude wrote on
-    # the prior turn). Default off → v2 behaviour. See
-    # ``sagent/providers/anthropic_cli_session/`` and the
-    # ``v2.1-cli-session-materialize`` worklog thread.
-    materialize_session = os.environ.get("SAGENT_CLI_OWN_SESSION", "").lower() in (
-        "1",
-        "true",
-        "yes",
+    # v2.1-β graduated 2026-06-09: sagent owns the on-disk session
+    # JSONL by default, rewriting it from its tape view before every
+    # ``--resume`` spawn. Operators can opt out (fall back to v2
+    # CLI-owned mode) by setting ``SAGENT_CLI_OWN_SESSION=0`` (or
+    # ``false``/``no``). See ``sagent/providers/anthropic_cli_session/``
+    # and the ``v2.1-cli-session-materialize`` worklog thread for
+    # the live-validation that gated the graduation
+    # (canary smoke + 3 critical-path live tests + 1 production
+    # multi-agent live run including a vmap-debug session).
+    opt_out = os.environ.get("SAGENT_CLI_OWN_SESSION", "").lower() in (
+        "0",
+        "false",
+        "no",
     )
+    materialize_session = not opt_out
     # NOTE: must not collide with sagent's bridge server name (``"sagent"``,
     # hardcoded at sagent/providers/lib/mcp_bridge.py:175). The bridge
     # exposes Read/Bash/Glob/Grep/etc. as ``mcp__sagent__<tool>``; the

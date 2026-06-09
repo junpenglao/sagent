@@ -29,7 +29,10 @@ import tempfile
 from sagent.lib import token_count
 from sagent.lib.json import JSON, MutableJSON, int_val, validate_json_schema
 from sagent.providers.anthropic import Anthropic
-from sagent.providers.anthropic_cli_session import materialize_session
+from sagent.providers.anthropic_cli_session import (
+    materialize_session,
+    session_jsonl_path,
+)
 from sagent.providers.lib.cost import ModelProfile, Pricing
 from sagent.providers.lib.hotspare import HotSpare
 from sagent.providers.lib.mcp_bridge import ToolsBridge
@@ -1461,9 +1464,9 @@ def _load_cli_credentials_file(path: Path) -> AnthropicCLICredentials | None:
 
 def _session_jsonl_exists(session_id: str) -> bool:
     """Check whether claude already has a session transcript for this
-    uuid on disk (under the operator's real HOME).
+    uuid on disk, under THIS cwd's encoded project dir.
 
-    Used at construction time so that on ``serve.py`` restart we
+    Used at construction time so that on a host-application restart we
     pick the right initial flag: ``--resume`` (the JSONL exists, we
     continue the prior conversation) vs ``--session-id`` (no prior
     session, we establish a fresh one). Picking the wrong one makes
@@ -1471,15 +1474,20 @@ def _session_jsonl_exists(session_id: str) -> bool:
     ``--session-id`` on an existing session errors with "Session ID
     is already in use", ``--resume`` on a nonexistent one errors
     with "No conversation found".
+
+    The check must be cwd-AWARE: claude indexes sessions per
+    encoded-cwd project dir (``~/.claude/projects/-<encoded-cwd>/``)
+    and ``--resume`` cannot see a session recorded under a different
+    cwd. The original implementation globbed ACROSS project dirs
+    ("the encoding is opaque to us") -- a latent bug once two
+    deployments derive the same deterministic session uuid: live repro
+    2026-06-09, where a second server instance launched from a scratch
+    cwd globbed the primary deployment's JSONL into ``True``, spawned
+    ``--resume``, and claude exited ``No conversation found``, wedging
+    warmup for all five agents. ``session_jsonl_path`` mirrors the
+    CLI's encoding exactly, so ask the question claude will answer.
     """
-    home = Path(os.environ.get("HOME", "~")).expanduser()
-    projects = home / ".claude" / "projects"
-    if not projects.exists():
-        return False
-    # The cwd-encoded subdir is opaque to us; glob across all of them.
-    for _ in projects.glob(f"*/{session_id}.jsonl"):
-        return True
-    return False
+    return session_jsonl_path(session_id, cwd=Path.cwd()).exists()
 
 
 def _populate_anthropic_tmpdir(tmpdir: Path, account: str | None) -> None:

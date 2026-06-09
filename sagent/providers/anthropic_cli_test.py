@@ -24,8 +24,10 @@ from sagent.providers.anthropic_cli import (
     _hash_system,
     _round_context_tokens,
     _serialize_for_stdin,
+    _session_jsonl_exists,
     _user_line,
 )
+from sagent.providers.anthropic_cli_session import session_jsonl_path
 from sagent.providers.lib.hotspare import HotSpare
 from sagent.providers.lib.subproc import (
     Subproc,
@@ -355,6 +357,40 @@ def test_model_session_id_initialises_session_persistent_mode() -> None:
     m_stateless = provider.model("claude-haiku-4-5")
     assert m_stateless._session_id is None
     assert m_stateless._hot_spare is not None
+
+
+def test_session_jsonl_exists_is_cwd_aware(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The resume-vs-mint probe only sees sessions under THIS cwd's
+    encoded project dir.
+
+    Claude indexes sessions per encoded-cwd project dir and ``--resume``
+    cannot reach across. The probe used to glob across ALL project dirs,
+    which broke the moment two deployments derived the same
+    deterministic per-role uuid: live repro 2026-06-09 — a second
+    server instance launched from a scratch cwd found the primary
+    deployment's JSONL via the glob, chose ``--resume``, and claude
+    exited ``No conversation found``, wedging warmup for all five
+    agents.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    sid = "deadbeef-1234-5678-9abc-deadbeef1234"
+
+    cwd_a = tmp_path / "deploy-a"
+    cwd_b = tmp_path / "deploy-b"
+    cwd_a.mkdir()
+    cwd_b.mkdir()
+
+    # Record a session under deploy-a's encoded dir only.
+    jsonl_a = session_jsonl_path(sid, cwd=cwd_a)
+    jsonl_a.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_a.write_text("{}\n")
+
+    monkeypatch.chdir(cwd_a)
+    assert _session_jsonl_exists(sid) is True  # same cwd → resume
+    monkeypatch.chdir(cwd_b)
+    assert _session_jsonl_exists(sid) is False  # other cwd → fresh session
 
 
 def test_user_line_text_only() -> None:
@@ -921,33 +957,40 @@ def test_is_retryable_provider_error_session_persistent_only(
 def test_model_session_initialized_probes_disk_at_construction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``serve.py`` restart should pick up prior conversations
-    transparently: at construction time the provider probes
-    ``$HOME/.claude/projects/*/<uuid>.jsonl`` and sets
-    ``_session_initialized = True`` if any match -- so the first
-    spawn uses ``--resume`` (not ``--session-id``, which would
-    error with "Session ID is already in use").
+    """Host-application restart should pick up prior conversations
+    transparently: at construction time the provider probes for the
+    session JSONL under THIS cwd's encoded project dir and sets
+    ``_session_initialized = True`` on a hit -- so the first spawn
+    uses ``--resume`` (not ``--session-id``, which would error with
+    "Session ID is already in use"). The probe is cwd-aware: a JSONL
+    for the same uuid under a DIFFERENT cwd's project dir must not
+    count (claude's ``--resume`` can't see it; see
+    ``test_session_jsonl_exists_is_cwd_aware``).
     """
     sid = "deadbeef-1234-5678-9abc-deadbeef1234"
     other = "1c0705bd-ecf6-55a2-91cc-9d519e9ca6f6"
 
     # Stage 1: empty $HOME -> session_initialized is False.
     monkeypatch.setenv("HOME", str(tmp_path))
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
     provider = AnthropicCLI()
     model = provider.model("claude-haiku-4-5", session_id=sid)
     assert model._session_initialized is False
 
-    # Stage 2: drop a session JSONL for OUR sid under an arbitrary
-    # cwd-encoded subdir -> session_initialized flips to True.
-    proj = tmp_path / ".claude" / "projects" / "-some-cwd"
-    proj.mkdir(parents=True)
-    (proj / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+    # Stage 2: drop a session JSONL for OUR sid under THIS cwd's
+    # encoded project dir -> session_initialized flips to True.
+    ours = session_jsonl_path(sid, cwd=workdir)
+    ours.parent.mkdir(parents=True, exist_ok=True)
+    ours.write_text("{}\n", encoding="utf-8")
     model = provider.model("claude-haiku-4-5", session_id=sid)
     assert model._session_initialized is True
 
     # Stage 3: jsonl exists for a DIFFERENT uuid but not ours -> still False.
-    (proj / f"{other}.jsonl").write_text("{}\n", encoding="utf-8")
-    (proj / f"{sid}.jsonl").unlink()
+    other_jsonl = session_jsonl_path(other, cwd=workdir)
+    other_jsonl.write_text("{}\n", encoding="utf-8")
+    ours.unlink()
     model = provider.model("claude-haiku-4-5", session_id=sid)
     assert model._session_initialized is False
 

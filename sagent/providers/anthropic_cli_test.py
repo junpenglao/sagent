@@ -254,7 +254,8 @@ def test_argv_contains_required_flags() -> None:
 
 def test_argv_session_id_swaps_no_persistence_for_session_id_flag() -> None:
     """First-turn argv carries ``--session-id <uuid>`` instead of
-    ``--no-session-persistence``."""
+    ``--no-session-persistence``.
+    """
     argv = _build_anthropic_argv(
         model_id="claude-sonnet-4-5",
         system_prompt="be brief",
@@ -272,7 +273,8 @@ def test_argv_session_id_swaps_no_persistence_for_session_id_flag() -> None:
 
 def test_argv_session_id_resume_existing_uses_resume_flag() -> None:
     """``resume_existing=True`` → ``--resume <uuid>``, no
-    ``--session-id``."""
+    ``--session-id``.
+    """
     argv = _build_anthropic_argv(
         model_id="claude-sonnet-4-5",
         system_prompt="be brief",
@@ -303,7 +305,8 @@ def test_argv_default_session_id_none_preserves_stateless_flag() -> None:
 
 def test_model_session_id_initialises_session_persistent_mode() -> None:
     """``AnthropicCLI.model(session_id=...)`` flips the mode flag,
-    bypasses HotSpare, and starts uninitialised."""
+    bypasses HotSpare, and starts uninitialised.
+    """
     provider = AnthropicCLI()
     sid = "deadbeef-1234-5678-9abc-deadbeef1234"
     m = provider.model("claude-haiku-4-5", session_id=sid)
@@ -333,7 +336,8 @@ def test_serialize_for_stdin_rejects_tool_result() -> None:
 
 def test_anthropic_subprocess_env_overrides_home_when_tmpdir_set() -> None:
     """Stateless mode (or session-persistent + per-account): tmpdir
-    becomes HOME so the renamed credentials file is found."""
+    becomes HOME so the renamed credentials file is found.
+    """
     from sagent.providers.anthropic_cli import _anthropic_subprocess_env
 
     env = _anthropic_subprocess_env(Path("/tmp/probe"))
@@ -345,11 +349,44 @@ def test_anthropic_subprocess_env_overrides_home_when_tmpdir_set() -> None:
 
 def test_anthropic_subprocess_env_skip_history_off_when_persistent() -> None:
     """Session-persistent mode keeps the SKIP_PROMPT_HISTORY var unset
-    so claude actually writes its session JSONL."""
+    so claude actually writes its session JSONL.
+    """
     from sagent.providers.anthropic_cli import _anthropic_subprocess_env
 
     env = _anthropic_subprocess_env(Path("/tmp/probe"), persist_session=True)
     assert "CLAUDE_CODE_SKIP_PROMPT_HISTORY" not in env
+
+
+def test_anthropic_subprocess_env_disables_autocompact_in_materialize_mode() -> None:
+    """v2.1-α: ``materialize_session=True`` must disable claude's auto-compact.
+
+    Rationale: in materialize mode sagent's tape is the source of truth
+    and overwrites the on-disk JSONL each turn. If claude auto-compacts
+    mid-session, it writes a ``system/compact_boundary`` to the file
+    that sagent's tape doesn't carry. The next materialize-overwrite
+    cycle would clobber claude's compaction, restoring the full
+    pre-compaction history and re-triggering the blocking_limit. So we
+    suppress claude's compactor and rely on sagent's own (which
+    records compactions as ``ContextSplice`` on the tape, which the
+    materializer renders as the resolved view).
+    """
+    from sagent.providers.anthropic_cli import _anthropic_subprocess_env
+
+    # v2 baseline: session-persistent + NOT materialize → auto-compact ENABLED
+    env_v2 = _anthropic_subprocess_env(
+        Path("/tmp/probe"), persist_session=True, materialize_session=False
+    )
+    assert "DISABLE_AUTO_COMPACT" not in env_v2
+
+    # v2.1-α: session-persistent + materialize → auto-compact DISABLED
+    env_v21 = _anthropic_subprocess_env(
+        Path("/tmp/probe"), persist_session=True, materialize_session=True
+    )
+    assert env_v21.get("DISABLE_AUTO_COMPACT") == "1"
+
+    # Stateless mode (regardless of materialize flag) always disables
+    env_stateless = _anthropic_subprocess_env(Path("/tmp/probe"), persist_session=False)
+    assert env_stateless.get("DISABLE_AUTO_COMPACT") == "1"
 
 
 @pytest.mark.asyncio
@@ -378,7 +415,8 @@ async def test_session_persistent_stream_returns_empty_when_history_cleared(
         return "/usr/bin/claude"
 
     monkeypatch.setattr(
-        "sagent.providers.anthropic_cli.shutil.which", _which_claude,
+        "sagent.providers.anthropic_cli.shutil.which",
+        _which_claude,
     )
     # Point HOME at tmp_path so the JSONL-cleanup glob is sandboxed.
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -400,10 +438,14 @@ async def test_session_persistent_stream_returns_empty_when_history_cleared(
     # Stage 2: simulate post-``agent.clear()`` call: history is empty
     # but the provider's counters still think 2 messages were sent.
     request = ModelRequest(
-        system="terse", messages=(), tools=(),
+        system="terse",
+        messages=(),
+        tools=(),
     )
     response = await model.stream(
-        request, on_text=None, on_thinking=None,
+        request,
+        on_text=None,
+        on_thinking=None,
     )
 
     # The response is a no-op (empty assistant text, no tools, zero
@@ -475,6 +517,7 @@ async def test_session_persistent_advances_sent_index_per_entry_on_partial_failu
 
     async def _ensure() -> None:
         bridge_calls.append("ensure")
+
     model._ensure_tools_bridge = _ensure  # ty: ignore[invalid-assignment]
     model._sync_tools_bridge = lambda r: bridge_calls.append(("sync", r))  # ty: ignore[invalid-assignment]
 
@@ -485,11 +528,14 @@ async def test_session_persistent_advances_sent_index_per_entry_on_partial_failu
     async def _send_entry(proc: object, entry: TapeEvent) -> None:
         del proc
         sent_entries.append(entry)
+
     model._send_entry = _send_entry  # ty: ignore[invalid-assignment]
 
     drain_calls = 0
-    async def _drain(proc: object, on_text=None, on_thinking=None,
-                     update_input_tokens: bool = True):  # noqa: ANN001
+
+    async def _drain(
+        proc: object, on_text=None, on_thinking=None, update_input_tokens: bool = True
+    ):
         del proc, on_text, on_thinking, update_input_tokens
         nonlocal drain_calls
         drain_calls += 1
@@ -504,13 +550,16 @@ async def test_session_persistent_advances_sent_index_per_entry_on_partial_failu
         # is the equivalent of the aborted_streaming on the abort cycle
         # that prevented TL's STOP from being processed in production.
         raise SubprocessTransportError("simulated abort on entry 2")
+
     model._drain_until_result = _drain  # ty: ignore[invalid-assignment]
 
     # Three entries queued. _last_sent_index = 5 means request.messages
     # has 8 entries; entries 5, 6, 7 are the new user-like ones.
     msg_E1 = AgentSendMessage(source="tl", text="entry 1 — should land cleanly")
     msg_E2 = AgentSendMessage(source="tl", text="entry 2 — drain aborts on this one")
-    msg_E3 = AgentSendMessage(source="tl", text="entry 3 — STOP directive that must NOT be lost")
+    msg_E3 = AgentSendMessage(
+        source="tl", text="entry 3 — STOP directive that must NOT be lost"
+    )
     request = ModelRequest(
         system="x",
         messages=(
@@ -554,8 +603,10 @@ def test_is_event_retryable_classifies_organic_shapes() -> None:
     #    2026-06-03 10:17:53 — 418k cache reads attempt that died on
     #    a tool_use boundary). Retryable.
     aborted_streaming = {
-        "type": "result", "subtype": "error_during_execution",
-        "is_error": True, "stop_reason": "tool_use",
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": True,
+        "stop_reason": "tool_use",
         "terminal_reason": "aborted_streaming",
         "errors": [
             "[ede_diagnostic] result_type=user last_content_type=n/a "
@@ -688,8 +739,10 @@ def test_model_session_initialized_probes_disk_at_construction(
 def test_anthropic_subprocess_env_inherits_real_home_when_tmpdir_none() -> None:
     """Session-persistent + single-account: ``tmpdir=None`` means the
     subprocess inherits the operator's real HOME so native tools (Bash,
-    gh, git) find ``~/.config/`` and ``~/.gitconfig``."""
+    gh, git) find ``~/.config/`` and ``~/.gitconfig``.
+    """
     import os as _os
+
     from sagent.providers.anthropic_cli import _anthropic_subprocess_env
 
     operator_home = _os.environ.get("HOME", "")
@@ -710,11 +763,17 @@ def test_dispatch_stream_event_routes_text_and_thinking() -> None:
     tool_use_blocks: dict[int, dict[str, object]] = {}
     text_event = cast(
         MutableJSON,
-        {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hello"}},
+        {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "hello"},
+        },
     )
     thinking_event = cast(
         MutableJSON,
-        {"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "reflecting"}},
+        {
+            "type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "reflecting"},
+        },
     )
     _dispatch_stream_event(
         text_event,
@@ -740,7 +799,8 @@ def test_dispatch_stream_event_routes_text_and_thinking() -> None:
 
 def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
     """tool_use is published at content_block_stop with name + arg
-    summary, after the streamed input_json_delta has been accumulated."""
+    summary, after the streamed input_json_delta has been accumulated.
+    """
     from sagent.agent.runtime import cli_publish_var
     from sagent.types.runtime import ToolLabel
 
@@ -765,8 +825,11 @@ def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
                     },
                 },
             ),
-            text_parts, thinking_parts, tool_use_blocks,
-            on_text=None, on_thinking=None,
+            text_parts,
+            thinking_parts,
+            tool_use_blocks,
+            on_text=None,
+            on_thinking=None,
         )
         assert published == []  # nothing yet -- we wait for args
         # 2) deltas: stream the JSON in two chunks
@@ -780,8 +843,11 @@ def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
                         "delta": {"type": "input_json_delta", "partial_json": partial},
                     },
                 ),
-                text_parts, thinking_parts, tool_use_blocks,
-                on_text=None, on_thinking=None,
+                text_parts,
+                thinking_parts,
+                tool_use_blocks,
+                on_text=None,
+                on_thinking=None,
             )
         assert published == []  # still nothing
         # 3) stop: now we publish the rich label
@@ -790,8 +856,11 @@ def test_dispatch_stream_event_publishes_rich_tool_label_at_stop() -> None:
                 MutableJSON,
                 {"type": "content_block_stop", "index": 0},
             ),
-            text_parts, thinking_parts, tool_use_blocks,
-            on_text=None, on_thinking=None,
+            text_parts,
+            thinking_parts,
+            tool_use_blocks,
+            on_text=None,
+            on_thinking=None,
         )
     finally:
         cli_publish_var.reset(token)
@@ -820,14 +889,20 @@ def test_dispatch_stream_event_no_label_for_text_block_start() -> None:
                     "content_block": {"type": "text", "text": ""},
                 },
             ),
-            [], [], tool_use_blocks,
-            on_text=None, on_thinking=None,
+            [],
+            [],
+            tool_use_blocks,
+            on_text=None,
+            on_thinking=None,
         )
         # And a content_block_stop on the text block: no label.
         _dispatch_stream_event(
             cast(MutableJSON, {"type": "content_block_stop", "index": 1}),
-            [], [], tool_use_blocks,
-            on_text=None, on_thinking=None,
+            [],
+            [],
+            tool_use_blocks,
+            on_text=None,
+            on_thinking=None,
         )
     finally:
         cli_publish_var.reset(token)

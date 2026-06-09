@@ -1136,6 +1136,7 @@ class _AnthropicCLIModel:
             env=_anthropic_subprocess_env(
                 tmpdir,
                 persist_session=self._session_id is not None,
+                materialize_session=self._materialize_session,
             ),
             tmpdir=spawn_owned_tmpdir,
         )
@@ -1375,7 +1376,10 @@ def _populate_anthropic_tmpdir(tmpdir: Path, account: str | None) -> None:
 
 
 def _anthropic_subprocess_env(
-    tmpdir: Path | None, *, persist_session: bool = False
+    tmpdir: Path | None,
+    *,
+    persist_session: bool = False,
+    materialize_session: bool = False,
 ) -> dict[str, str]:
     """Build the env for the ``claude`` subprocess (telemetry off, hermetic HOME).
 
@@ -1390,6 +1394,18 @@ def _anthropic_subprocess_env(
     credentials + project session JSONLs AND its native tools (Bash,
     gh, git, ...) find ``~/.config/`` and ``~/.gitconfig`` naturally.
     Used by the session-persistent + single-account path.
+
+    ``materialize_session`` (v2.1-α): when True, sagent owns the
+    on-disk JSONL via the materializer and overwrites claude's writes
+    each turn. Claude's auto-compact would record a
+    ``system/compact_boundary`` to the file that sagent's tape doesn't
+    know about; the next materialize-overwrite cycle would clobber
+    it, restoring the full pre-compaction history and re-triggering
+    the blocking_limit. So in materialize mode we suppress claude's
+    auto-compact and rely on sagent's own ``SummaryCompactor`` (which
+    records compaction as a ``ContextSplice`` on the tape, which the
+    materializer renders as the resolved view). Mirrors the
+    stateless-mode rule.
     """
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     if tmpdir is not None:
@@ -1409,16 +1425,11 @@ def _anthropic_subprocess_env(
             "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS": "1",
         }
     )
-    # Auto-compact:
-    #   - Stateless mode (sagent owns history via re-feed): keep
-    #     ``DISABLE_AUTO_COMPACT=1`` so claude's compactor doesn't
-    #     race sagent's ``SummaryCompactor``.
-    #   - Session-persistent mode: sagent doesn't own history, claude
-    #     does. LET claude's own compactor run -- otherwise a long
-    #     session walks into ``terminal_reason: blocking_limit`` and
-    #     the session JSONL ends with ``"Prompt is too long"`` on
-    #     every ``--resume`` (SWE failure 2026-06-03 ~08:46-08:54).
-    if not persist_session:
+    # Auto-compact: disable when sagent owns history (stateless mode
+    # AND v2.1-α materialize mode); enable in v2 session-persistent
+    # mode where claude is the sole writer.
+    sagent_owns_history = not persist_session or materialize_session
+    if sagent_owns_history:
         env["DISABLE_AUTO_COMPACT"] = "1"
     if not persist_session:
         env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .common import MODEL_SONNET, build_agent
+from .common import MODEL_OPUS, build_agent
 
 
 _ROLE_MD = Path(__file__).with_suffix("").with_name("statistician.md")
@@ -58,5 +58,5 @@ def build():
             sandboxed_tools.SandboxedWrite(sandbox_root=sandbox),
             sandboxed_tools.SandboxedEdit(sandbox_root=sandbox),
         ],
-        model_id=MODEL_SONNET,
+        model_id=MODEL_OPUS,
     )
